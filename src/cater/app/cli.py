@@ -751,3 +751,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"invalid value: {exc}", file=sys.stderr)
         return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
