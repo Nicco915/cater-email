@@ -123,7 +123,7 @@ def create_app(
             )
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'none'; style-src 'self'; img-src 'self' data:; "
@@ -167,8 +167,19 @@ def create_app(
             raise HTTPException(status_code=400, detail="Invalid form submission") from exc
 
     def verify_csrf(request: Request, form: Any) -> None:
-        if not origin_allowed(request.headers.get("origin")):
-            raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+        origin = request.headers.get("origin")
+        if origin is not None and origin.strip().lower() == "null":
+            # Pages cached before the Referrer-Policy fix post with an empty
+            # Origin; tell the operator exactly how to recover.
+            raise HTTPException(
+                status_code=403,
+                detail="无法确认请求来源（Origin 为空）：浏览器可能仍使用旧版页面，请刷新页面后重新提交",
+            )
+        request_origin = f"{request.url.scheme}://{request.url.netloc}"
+        if not origin_allowed(origin, request_origin):
+            raise HTTPException(
+                status_code=403, detail="跨站请求被拒绝：请从本机管理页面重新操作"
+            )
         supplied = form.get(CSRF_FIELD) or request.headers.get("x-csrf-token")
         expected = request.state.session.get("csrf")
         if not session_signer.tokens_equal(expected, str(supplied or "")):

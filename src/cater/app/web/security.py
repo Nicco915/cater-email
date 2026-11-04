@@ -58,19 +58,57 @@ def request_host_allowed(host_header: str | None) -> bool:
     return host in LOOPBACK_HOSTS
 
 
-def origin_allowed(origin: str | None) -> bool:
-    if not origin:
-        return True
+def _split_origin(value: str | None) -> tuple[str, str, int] | None:
+    """Normalize an origin into ``(scheme, host, port)`` or ``None``.
+
+    Only loopback http(s) origins without userinfo or path components are
+    accepted. Default ports are normalized so ``http://localhost`` equals
+    ``http://localhost:80``.
+    """
+
+    if not value:
+        return None
     from urllib.parse import urlsplit
 
     try:
-        parsed = urlsplit(origin)
+        parsed = urlsplit(value)
+        port = parsed.port
     except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    host = parsed.hostname.lower().strip("[]")
+    if host not in {item.strip("[]") for item in LOOPBACK_HOSTS}:
+        return None
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return (parsed.scheme, host, port)
+
+
+def origin_allowed(origin: str | None, request_origin: str | None) -> bool:
+    """Exact same-origin check for browser form posts.
+
+    * No ``Origin`` header (older clients, CLI, TestClient): allowed; the
+      CSRF token validation still applies.
+    * ``Origin: null`` or an unparsable/hostile origin: rejected.
+    * Otherwise scheme, host and port must match the current request origin
+      exactly. ``localhost``, ``127.0.0.1`` and ``::1`` each only match
+      themselves; a different loopback name, port or scheme is cross-origin.
+    """
+
+    if not origin:
+        return True
+    if origin.strip().lower() == "null":
         return False
-    if parsed.scheme not in {"http", "https"}:
+    parsed = _split_origin(origin)
+    expected = _split_origin(request_origin)
+    if parsed is None or expected is None:
         return False
-    host = parsed.hostname or ""
-    return host.lower() in {item.strip("[]") for item in LOOPBACK_HOSTS}
+    return parsed == expected
 
 
 class SessionSigner:

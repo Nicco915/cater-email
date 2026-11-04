@@ -46,6 +46,7 @@ def test_loopback_pages_and_security_headers_render(service) -> None:
         assert response.status_code == 200
         assert "CATER" in response.text
         assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "same-origin"
         assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
 
 
@@ -91,6 +92,71 @@ def test_cross_origin_post_is_rejected_even_with_token(service) -> None:
             follow_redirects=False,
         )
         assert response.status_code == 403
+
+
+def _settings_payload(token: str) -> dict:
+    return {
+        CSRF_FIELD: token,
+        "mode": "test",
+        "test": "tester@example.com",
+        "production": "",
+        "dry_run": "true",
+        "enabled": "false",
+        "poll_interval": "60",
+        "reason": "web-origin-test",
+    }
+
+
+def test_same_origin_post_with_matching_origin_header_succeeds(service) -> None:
+    with _client(service) as client:
+        client.get("/settings")
+        token = _csrf(client)
+        response = client.post(
+            "/settings",
+            headers={"origin": BASE_URL},
+            data=_settings_payload(token),
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+
+
+def test_origin_must_match_scheme_host_and_port_exactly(service) -> None:
+    with _client(service) as client:
+        client.get("/settings")
+        token = _csrf(client)
+        hostile_origins = [
+            "http://127.0.0.1:9999",  # wrong port
+            "https://127.0.0.1:8765",  # wrong scheme
+            "http://localhost:8765",  # different loopback host is cross-origin
+            "http://user@127.0.0.1:8765",  # userinfo is never same-origin
+            "http://127.0.0.1:8765/path",  # origins never carry a path
+            "null",
+        ]
+        for origin in hostile_origins:
+            response = client.post(
+                "/settings",
+                headers={"origin": origin},
+                data=_settings_payload(token),
+                follow_redirects=False,
+            )
+            assert response.status_code == 403, origin
+            assert "Invalid CSRF" not in response.text
+
+
+def test_null_origin_rejection_explains_how_to_recover(service) -> None:
+    # Browsers posting from a page cached with the old no-referrer policy send
+    # ``Origin: null``; the operator must know to refresh the page.
+    with _client(service) as client:
+        client.get("/settings")
+        token = _csrf(client)
+        response = client.post(
+            "/settings",
+            headers={"origin": "null"},
+            data=_settings_payload(token),
+            follow_redirects=False,
+        )
+        assert response.status_code == 403
+        assert "刷新页面" in response.text
 
 
 def test_artifact_download_is_controlled_by_task_root(service, offline_source: Path) -> None:
