@@ -100,3 +100,5 @@ cleanup  diagnostics  credentials
 ## 一键测试与生产切换
 
 Windows 双击 `start-test.bat` 或 `start-production.bat`。分别绑定独立的本地TOML、runtime/test或runtime/production目录、8766或8765端口，首次自动复制配置样例。窗口提示为英文，使用UTF-8代码页。首次安装与完整实单测试、重复测试、生产切换、计划任务绑定及回退步骤见 [测试与生产切换手册](docs/testing-and-production.md)。
+
+Windows首次实单测试可先双击 `initialize-test.bat` 自动安装缺失环境、初始化测试库并选择/导入机型参考Excel，再填写 `.env` 和测试白名单，双击 `start-test.bat`。服务就绪后自动打开本地网页；启动/初始化窗口在退出或失败后保留，方便复制错误。详见测试与生产切换手册的“快速路径”。

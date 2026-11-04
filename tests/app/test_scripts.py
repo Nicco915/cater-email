@@ -154,3 +154,24 @@ def test_environment_launchers_are_utf8_and_bind_separate_configs(tmp_path):
     script = _read('run-web.ps1')
     assert '@("--config", $Config)' in script
     assert '@("--runtime", $Runtime)' in script
+
+
+def test_interactive_launchers_keep_console_and_initialize_test_only():
+    for name in ('start-test.bat', 'start-production.bat', 'initialize-test.bat'):
+        content = (REPO_ROOT / name).read_bytes()
+        assert b'\r\n' in content and b'\\r\\n' not in content
+        text = content.decode('utf-8')
+        assert 'chcp 65001' in text
+        assert '"%ComSpec%" /D /K call "%~f0" --console' in text
+        assert 'if /I "%~1"=="--console" goto run' in text
+        assert 'Exit code: %CATER_EXIT_CODE%' in text
+    for name in ('start-test.bat', 'start-production.bat'):
+        assert '-OpenBrowser' in (REPO_ROOT / name).read_text()
+    initializer = _read('initialize-test.ps1')
+    assert 'runtime/test' in initializer and 'runtime/production' not in initializer
+    assert '"import-machines", $ReferencePath' in initializer
+    assert 'OpenFileDialog' in initializer
+    assert '"settings", "--json"' in initializer
+    assert '"--enable"' not in initializer
+    launcher = _read('run-web.ps1')
+    assert 'api/health' in launcher and 'Start-Process $Url' in launcher

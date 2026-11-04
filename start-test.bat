@@ -1,39 +1,32 @@
 @echo off
 chcp 65001 >nul
+if /I "%~1"=="--console" goto run
+start "CATER TEST" "%ComSpec%" /D /K call "%~f0" --console
+exit /b
+:run
 setlocal
 cd /d "%~dp0"
 title CATER - TEST
 echo CATER TEST
 echo Data: %CD%\runtime\test
 echo Web: http://127.0.0.1:8766/
-echo Close this window or press Ctrl+C to stop.
+echo Keep this window open. Errors remain visible here.
 echo.
 if not exist ".venv\Scripts\python.exe" (
-    echo Python environment not found. Run scripts\install.ps1 first.
-    pause
+    echo Python environment not found. Double-click initialize-test.bat first.
     exit /b 1
 )
 if not exist "config\test.local.toml" (
     copy /y "config\test.example.toml" "config\test.local.toml" >nul
-    if errorlevel 1 (
-        echo Failed to create local configuration.
-        pause
-        exit /b 1
-    )
-    echo Created config\test.local.toml.
-    echo Edit the allowlist before sending test or production mail.
+    if errorlevel 1 exit /b 1
+    echo Created config\test.local.toml. Review the allowlist.
 )
-if not exist ".env" (
-    echo No .env found. Mail uses OS environment or TOML settings.
-)
-echo Sending is controlled by this environment's effective settings.
-echo Test mode can send real mail when explicitly enabled.
-echo Do not run both modes against the same mailbox folder.
+echo Sending follows the effective settings of this environment.
+echo Do not run test and production against the same mailbox folder.
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-web.ps1" -Config "config\test.local.toml" -Runtime "runtime\test" -Port 8766
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\run-web.ps1" -Config "config\test.local.toml" -Runtime "runtime\test" -Port 8766 -OpenBrowser
 set "CATER_EXIT_CODE=%ERRORLEVEL%"
-if not "%CATER_EXIT_CODE%"=="0" (
-    echo CATER exited with code %CATER_EXIT_CODE%.
-    pause
-)
+echo.
+echo CATER stopped. Exit code: %CATER_EXIT_CODE%.
+echo Review the error above and runtime logs before restarting.
 exit /b %CATER_EXIT_CODE%

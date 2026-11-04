@@ -14,6 +14,7 @@
 #>
 param(
     [switch]$NoPoll,
+    [switch]$OpenBrowser,
     [int]$Port = 8765,
     [string]$Config = "",
     [string]$Runtime = ""
@@ -33,9 +34,34 @@ $Arguments = @("-m", "cater.app.cli", "serve", "--port", "$Port")
 if ($NoPoll) { $Arguments += "--no-poll" }
 if ($Config) { $Arguments += @("--config", $Config) }
 if ($Runtime) { $Arguments += @("--runtime", $Runtime) }
-Invoke-CaterNative `
-    -Description "CATER web UI" `
-    -FilePath $Python `
-    -Arguments $Arguments `
-    -ExitOnFailure
+$BrowserJob = $null
+if ($OpenBrowser) {
+    $BrowserJob = Start-Job -ArgumentList $Port -ScriptBlock {
+        param($LocalPort)
+        $Url = "http://127.0.0.1:$LocalPort/"
+        for ($Attempt = 0; $Attempt -lt 60; $Attempt++) {
+            try {
+                $Response = Invoke-WebRequest -Uri ($Url + "api/health") -UseBasicParsing -TimeoutSec 2
+                if ($Response.StatusCode -eq 200) {
+                    Start-Process $Url
+                    return
+                }
+            } catch { }
+            Start-Sleep -Seconds 1
+        }
+        Write-Warning "Web UI did not become ready. Check the service console."
+    }
+}
+try {
+    Invoke-CaterNative `
+        -Description "CATER web UI" `
+        -FilePath $Python `
+        -Arguments $Arguments `
+        -ExitOnFailure
+} finally {
+    if ($null -ne $BrowserJob) {
+        Receive-Job $BrowserJob -ErrorAction SilentlyContinue
+        Remove-Job $BrowserJob -Force -ErrorAction SilentlyContinue
+    }
+}
 exit 0
