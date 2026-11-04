@@ -169,3 +169,53 @@ def test_web_secret_is_created_restrictively(config: AppConfig, service) -> None
     assert len(secret) >= 32
     assert path.read_text(encoding="ascii").strip() == secret
     assert path.stat().st_mode & 0o077 == 0
+
+def test_dotenv_mail_and_credentials_are_loaded_without_global_mutation(tmp_path, monkeypatch):
+    from cater.app.config import CredentialProvider
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv('CATER_IMAP_PASSWORD', raising=False)
+    monkeypatch.delenv('CATER_SMTP_PASSWORD', raising=False)
+    (tmp_path / '.env').write_text(
+        'CATER_MAIL_ACCOUNT=bot@example.com\n'
+        'CATER_IMAP_HOST=imap.example.com\nCATER_IMAP_PORT=1993\n'
+        'CATER_SMTP_HOST=smtp.example.com\nCATER_SMTP_SSL=false\n'
+        'CATER_SMTP_STARTTLS=true\n'
+        'CATER_IMAP_PASSWORD="literal # $VALUE secret"\n'
+        "CATER_SMTP_PASSWORD='smtp secret'\n", encoding='utf-8')
+    config = load_config(runtime_dir=tmp_path / 'runtime')
+    assert config.mail.account == 'bot@example.com'
+    assert config.mail.imap_port == 1993
+    assert config.mail.smtp_ssl is False
+    assert config.mail.smtp_starttls is True
+    provider = CredentialProvider()
+    assert provider.imap_password(config.mail.account) == 'literal # $VALUE secret'
+    assert provider.smtp_password(config.mail.account) == 'smtp secret'
+    assert 'literal # $VALUE secret' not in repr(config)
+    import os
+    assert 'CATER_IMAP_PASSWORD' not in os.environ
+    assert config.sending.dry_run and not config.sending.enabled
+
+
+def test_dotenv_precedence_and_restart_reload(tmp_path, monkeypatch):
+    from cater.app.config import CredentialProvider
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / 'config.toml'
+    path.write_text('[mail]\nimap_host="toml.example.com"\n')
+    env = tmp_path / '.env'
+    env.write_text('CATER_IMAP_HOST=env.example.com\nCATER_IMAP_PASSWORD=first\n')
+    monkeypatch.setenv('CATER_IMAP_HOST', 'os.example.com')
+    assert load_config(path).mail.imap_host == 'os.example.com'
+    monkeypatch.delenv('CATER_IMAP_HOST')
+    assert load_config(path).mail.imap_host == 'env.example.com'
+    assert CredentialProvider().imap_password('') == 'first'
+    env.write_text('CATER_IMAP_PASSWORD=second\n')
+    assert CredentialProvider().imap_password('') == 'second'
+    assert load_config(path).mail.imap_host == 'toml.example.com'
+
+
+def test_dotenv_parse_error_does_not_disclose_secret(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / '.env').write_text('CATER_IMAP_PASSWORD="do-not-disclose\n')
+    with pytest.raises(ConfigurationError) as exc:
+        load_config()
+    assert 'do-not-disclose' not in str(exc.value)

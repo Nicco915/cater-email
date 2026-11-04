@@ -10,6 +10,7 @@ config/config.toml
 config/*.local.toml
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

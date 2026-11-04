@@ -1,7 +1,7 @@
 """Configuration loading, validation and credential lookup.
 
-Secrets are never stored in ``config.toml``. They are read from environment
-variables or, on Windows, from the Windows Credential Manager. Configuration
+Secrets are never stored in ``config.toml``. They are read from a local .env,
+OS environment variables or the Windows Credential Manager. Configuration
 values may be overridden at runtime (with audit history) through the admin
 service; those overrides live in SQLite, not in this file.
 """
@@ -26,6 +26,37 @@ IMAP_PASSWORD_ENV = "CATER_IMAP_PASSWORD"
 SMTP_PASSWORD_ENV = "CATER_SMTP_PASSWORD"
 IMAP_CREDENTIAL_TARGET = "Cater/IMAP"
 SMTP_CREDENTIAL_TARGET = "Cater/SMTP"
+
+
+def _mail_environment() -> dict[str, str]:
+    """Read the working-directory .env as literal values; OS environment wins.
+
+    No shell evaluation or variable interpolation. Passwords never enter AppConfig.
+    """
+    values: dict[str, str] = {}
+    env_path = Path(os.environ.get("CATER_ENV_FILE", ".env"))
+    if env_path.is_file():
+        try:
+            lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+        except OSError as exc:
+            raise ConfigurationError("Cannot read mail environment file") from exc
+        for number, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, separator, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not separator or not key.startswith("CATER_"):
+                raise ConfigurationError(f"Invalid environment file entry at line {number}")
+            if value.startswith((chr(34), chr(39))):
+                if len(value) < 2 or value[-1] != value[0]:
+                    raise ConfigurationError(f"Invalid environment file quoting at line {number}")
+                value = value[1:-1]
+            values[key] = value
+    values.update(os.environ)
+    return values
 
 
 @dataclass(frozen=True)
@@ -206,9 +237,10 @@ def load_config(
     empty allowlists and live sending disabled.
     """
 
-    env_config = os.environ.get("CATER_CONFIG")
+    environment = _mail_environment()
+    env_config = environment.get("CATER_CONFIG")
     chosen_path = Path(path or env_config or DEFAULT_CONFIG_PATH)
-    runtime_env = os.environ.get("CATER_RUNTIME_DIR")
+    runtime_env = environment.get("CATER_RUNTIME_DIR")
     chosen_runtime = Path(runtime_dir or runtime_env or DEFAULT_RUNTIME_DIR)
 
     raw: dict[str, Any] = {}
@@ -244,6 +276,13 @@ def load_config(
 
     if runtime_raw.get("dir") and runtime_dir is None and not runtime_env:
         chosen_runtime = Path(str(runtime_raw["dir"]))
+
+    # Mail server settings may be kept together with credentials in .env.
+    mail_raw = dict(mail_raw)
+    for field_name in MailConfig.__dataclass_fields__:
+        env_key = "CATER_MAIL_ACCOUNT" if field_name == "account" else "CATER_" + field_name.upper()
+        if env_key in environment:
+            mail_raw[field_name] = environment[env_key]
 
     mail = MailConfig(
         account=str(mail_raw.get("account", "")).strip(),
@@ -431,10 +470,10 @@ def _wincred_write(target: str, username: str, secret: str) -> None:
 
 
 class CredentialProvider:
-    """Resolve secrets without ever persisting them in application files."""
+    """Resolve local .env/OS secrets or Windows credentials without logging them."""
 
     def __init__(self, environ: dict[str, str] | None = None) -> None:
-        self._environ = environ if environ is not None else dict(os.environ)
+        self._environ = environ if environ is not None else _mail_environment()
 
     def imap_password(self, account: str) -> str | None:
         return self._read(IMAP_PASSWORD_ENV, IMAP_CREDENTIAL_TARGET, account)

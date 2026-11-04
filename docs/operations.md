@@ -412,3 +412,11 @@ PowerShell -ExecutionPolicy Bypass -File scripts\backup.ps1
 > **测试环境版本说明。** 本轮测试在 Python 3.13 / macOS 上完成，`pyproject.toml` 的锁定版本与实际安装版本一致：**pytest 9.1.1**、**lxml 6.1.1**、**soupsieve 2.9.1**、openpyxl 3.1.5、beautifulsoup4 4.15.0、et_xmlfile 2.0.0。本手册引用的通过证据即来自这组版本，不需要再安装其他 pytest 版本。验收机应安装 `.[dev]` 后重跑，并记录 `python -m pytest --version` 的实际输出；若将来确有新版本功能需求，应先说明具体原因并重新验证后再修改锁定。
 
 本手册所述 Windows 任务计划、Windows 凭据管理器、真实 IMAP/SMTP 收发和休眠恢复**尚未在 Windows 目标机验收**；代码仅在开发环境通过离线模拟邮箱和真实核心样例转换测试。上线前必须由运维在目标机逐项验证并记录。
+
+## 使用 .env 统一配置邮箱
+
+将仓库根目录 `.env.example` 复制为 `.env`，填写邮箱地址、IMAP/SMTP服务器、端口、SSL/STARTTLS和两个授权码。以后通过现有启动脚本运行即可自动加载，无需每次输入密码或设置CMD环境变量。`.env` 是本机明文配置，已被Git忽略；只提交无真实凭证的 `.env.example`。
+
+邮箱参数优先级为系统环境变量 > `.env` > `config/config.toml`。密码优先级为系统环境变量 > `.env` > Windows凭据管理器。白名单、测试/生产模式和发信开关继续通过TOML或管理网页维护，`.env`不会自动启用发信。网页已保存的运行设置仍优先于TOML。
+
+值按字面量读取，不执行命令、不展开 `$变量`；密码建议使用单引号或双引号包裹，不支持多行值或引号后的行尾注释。修改后重启程序生效。默认读取启动工作目录的 `.env`，仓库启动脚本会自动切换到项目根目录；高级场景可用系统环境变量 `CATER_ENV_FILE` 指定其他文件。
