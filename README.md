@@ -95,3 +95,8 @@ cleanup  diagnostics  credentials
 邮箱参数优先级为系统环境变量 > `.env` > `config/config.toml`。密码优先级为系统环境变量 > `.env` > Windows凭据管理器。白名单、测试/生产模式和发信开关继续通过TOML或管理网页维护，`.env`不会自动启用发信。网页已保存的运行设置仍优先于TOML。
 
 值按字面量读取，不执行命令、不展开 `$变量`；密码建议使用单引号或双引号包裹，不支持多行值或引号后的行尾注释。修改后重启程序生效。默认读取启动工作目录的 `.env`，仓库启动脚本会自动切换到项目根目录；高级场景可用系统环境变量 `CATER_ENV_FILE` 指定其他文件。
+
+
+## 一键测试与生产切换
+
+Windows 双击 `start-test.bat` 或 `start-production.bat`。分别绑定独立的本地TOML、runtime/test或runtime/production目录、8766或8765端口，首次自动复制配置样例。窗口提示为英文，使用UTF-8代码页。首次安装与完整实单测试、重复测试、生产切换、计划任务绑定及回退步骤见 [测试与生产切换手册](docs/testing-and-production.md)。

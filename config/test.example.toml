@@ -1,0 +1,28 @@
+# Test configuration. Mail credentials are loaded from root .env.
+# Local admin settings stored in this environment database override this file.
+[runtime]
+dir = "runtime/test"
+
+[mail]
+folder = "INBOX"
+sent_folder = "Sent"
+poll_interval_seconds = 60
+first_run_new_only = true
+
+[allowlist]
+mode = "test"
+test = ["tester@example.com"]
+production = ["operator@example.com"]
+
+[sending]
+dry_run = true
+enabled = false
+
+[web]
+host = "127.0.0.1"
+port = 8766
+
+[logging]
+retention_days = 90
+task_file_retention_days = 365
+backup_retention = 30

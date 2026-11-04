@@ -14,7 +14,9 @@
 #>
 param(
     [switch]$NoPoll,
-    [int]$Port = 8765
+    [int]$Port = 8765,
+    [string]$Config = "",
+    [string]$Runtime = ""
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,8 @@ if (-not (Test-Path $Python)) {
 
 $Arguments = @("-m", "cater.app.cli", "serve", "--port", "$Port")
 if ($NoPoll) { $Arguments += "--no-poll" }
+if ($Config) { $Arguments += @("--config", $Config) }
+if ($Runtime) { $Arguments += @("--runtime", $Runtime) }
 Invoke-CaterNative `
     -Description "CATER web UI" `
     -FilePath $Python `

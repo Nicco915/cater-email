@@ -137,3 +137,20 @@ exit 0
 """,
     )
     assert result.returncode == 0
+
+def test_environment_launchers_are_utf8_and_bind_separate_configs(tmp_path):
+    from cater.app.config import load_config
+    for environment, port in [('test', 8766), ('production', 8765)]:
+        launcher = (REPO_ROOT / f'start-{environment}.bat').read_text(encoding='utf-8')
+        assert 'chcp 65001' in launcher
+        assert f'-Config "config\\{environment}.local.toml"' in launcher
+        assert f'-Runtime "runtime\\{environment}"' in launcher
+        assert f'-Port {port}' in launcher
+        config = load_config(REPO_ROOT / 'config' / f'{environment}.example.toml',
+                             runtime_dir=tmp_path / environment)
+        assert config.allowlist.mode == environment
+        assert config.sending.dry_run and not config.sending.enabled
+        assert config.web.port == port
+    script = _read('run-web.ps1')
+    assert '@("--config", $Config)' in script
+    assert '@("--runtime", $Runtime)' in script
