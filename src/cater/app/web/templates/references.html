@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}参考资料 · CATER{% endblock %}
+{% block content %}
+<h1>参考资料</h1>
+<p class="muted">国家与机型匹配只做精确规范化匹配和显式别名；不会模糊猜测或静默覆盖冲突。</p>
+
+<div class="grid2 panels">
+  <section class="panel">
+    <h2>新增国家别名</h2>
+    <form method="post" action="/references/alias" class="stack">
+      {% include "_csrf.html" %}
+      <label>别名（原文） <input type="text" name="alias" required maxlength="120"></label>
+      <label>ISO alpha-3 <input type="text" name="alpha3" required pattern="[A-Za-z]{3}" maxlength="3"></label>
+      <button type="submit">保存别名</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>导入机型库</h2>
+    <p class="muted">仅接受 Sheet1 的 xlsx 机型库；同机型不同目的国范围可共存，同范围且申报资料不同会被拒绝。导入由业务核心解析。</p>
+    <form method="post" action="/references/machines/import" enctype="multipart/form-data" class="stack">
+      {% include "_csrf.html" %}
+      <input type="file" name="file" accept=".xlsx" required>
+      <button type="submit">上传并导入</button>
+    </form>
+  </section>
+</div>
+
+<section class="panel">
+  <h2>国家（{{ countries|length }}）</h2>
+  <table class="grid">
+    <thead><tr><th>三位码</th><th>中文名</th><th>英文名</th></tr></thead>
+    <tbody>
+      {% for country in countries %}
+      <tr><td class="mono">{{ country.alpha3 }}</td><td>{{ country.name_zh }}</td><td>{{ country.name_en }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>国家别名（{{ aliases|length }}）</h2>
+  <table class="grid">
+    <thead><tr><th>别名</th><th>规范化</th><th>三位码</th><th>国家</th></tr></thead>
+    <tbody>
+      {% for alias in aliases %}
+      <tr><td>{{ alias.alias_raw }}</td><td class="mono">{{ alias.alias_norm }}</td><td class="mono">{{ alias.alpha3 }}</td><td>{{ alias.name_zh }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>机型（{{ machines|length }}）</h2>
+  {% if machines %}
+  <table class="grid">
+    <thead><tr><th>机型</th><th>目的国范围</th><th>特殊标记</th><th>英文品名</th><th>商品编码</th><th>商品名称</th><th>申报要素</th><th>别名</th></tr></thead>
+    <tbody>
+      {% for machine in machines %}
+      <tr>
+        <td class="mono">{{ machine.model }}</td>
+        <td class="mono">{{ machine.destination_scope or "default" }}</td>
+        <td>{{ machine.special or "-" }}{% if machine.special and not machine.special_rule_confirmed %} <span class="badge warn">未确认</span>{% endif %}</td>
+        <td>{{ machine.english_name or "-" }}</td>
+        <td class="mono">{{ machine.hs_code or "-" }}</td>
+        <td>{{ machine.product_name or "-" }}</td>
+        <td class="pre">{{ machine.declaration or "-" }}</td>
+        <td>{{ machine.aliases | join("、") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">机型库为空；请上传核心认可的 xlsx 文件。</p>{% endif %}
+</section>
+{% endblock %}

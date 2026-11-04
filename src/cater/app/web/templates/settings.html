@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}设置 · CATER{% endblock %}
+{% block content %}
+<h1>运行设置</h1>
+<div class="notice">配置变更会写入 <span class="mono">config_versions</span> 审计表。此处从不显示或保存邮箱密码；凭证请使用环境变量或 Windows 凭据管理器。</div>
+
+<section class="panel">
+  <h2>允许名单与发送</h2>
+  <form method="post" action="/settings" class="stack">
+    {% include "_csrf.html" %}
+    <label>允许名单模式
+      <select name="mode">
+        <option value="test" {% if settings["allowlist.mode"] == "test" %}selected{% endif %}>test（测试）</option>
+        <option value="production" {% if settings["allowlist.mode"] == "production" %}selected{% endif %}>production（生产）</option>
+      </select>
+    </label>
+    <label>测试允许发件人（逗号、分号或换行分隔）
+      <textarea name="test" rows="4">{{ settings["allowlist.test"] | join("\n") }}</textarea>
+    </label>
+    <label>生产允许发件人（逗号、分号或换行分隔）
+      <textarea name="production" rows="4">{{ settings["allowlist.production"] | join("\n") }}</textarea>
+    </label>
+    <div class="grid2">
+      <label>dry-run
+        <select name="dry_run">
+          <option value="true" {% if settings["sending.dry_run"] %}selected{% endif %}>true（不实际发信）</option>
+          <option value="false" {% if not settings["sending.dry_run"] %}selected{% endif %}>false（允许实发）</option>
+        </select>
+      </label>
+      <label>发送开关
+        <select name="enabled">
+          <option value="false" {% if not settings["sending.enabled"] %}selected{% endif %}>false（关闭）</option>
+          <option value="true" {% if settings["sending.enabled"] %}selected{% endif %}>true（启用）</option>
+        </select>
+      </label>
+    </div>
+    <label>轮询间隔（秒，最小 5）
+      <input type="number" name="poll_interval" min="5" value="{{ settings['scan.poll_interval_seconds'] }}">
+    </label>
+    <label class="check">
+      <input type="checkbox" name="production_ack" value="on">
+      我确认切换/使用 production 模式，并已核对生产允许名单（仅切换到 production 时需要）
+    </label>
+    <label>变更原因（审计用）
+      <input type="text" name="reason" value="web admin" maxlength="300">
+    </label>
+    <button type="submit" class="danger">保存设置</button>
+  </form>
+  <p class="muted">实际发信要求：发送开关为 true、dry-run 为 false，且收件人位于当前生效的允许名单中。出厂默认为 dry-run 且发送关闭。</p>
+</section>
+
+<section class="panel">
+  <h2>凭证状态（仅布尔值）</h2>
+  <dl class="facts">
+    {% for key, value in credential_presence.items() %}
+    <dt>{{ key }}</dt><dd>{{ "已配置" if value else "未检测到" }}</dd>
+    {% endfor %}
+  </dl>
+</section>
+
+<section class="panel">
+  <h2>配置审计</h2>
+  {% if audit %}
+  <table class="grid">
+    <thead><tr><th>#</th><th>键</th><th>操作者</th><th>原因</th><th>值</th><th>时间</th></tr></thead>
+    <tbody>
+      {% for item in audit %}
+      <tr>
+        <td>{{ item.id }}</td>
+        <td class="mono">{{ item.key }}</td>
+        <td>{{ item.actor }}</td>
+        <td>{{ item.reason or "-" }}</td>
+        <td><details><summary>查看</summary><pre>new: {{ item.value | jsonpretty }}
+previous: {{ item.previous | jsonpretty }}</pre></details></td>
+        <td class="nowrap">{{ item.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">尚无配置变更记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

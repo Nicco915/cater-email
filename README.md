@@ -1,1 +1,88 @@
-# cater-email
+# CATER — 邮件驱动出口单证本地应用
+
+CATER 在本地 Windows 电脑上监控工作邮箱，只处理允许名单发件人的业务邮件，调用离线转换核心生成配件/整机出口 Excel，并以邮件交付原发起人。所有邮件传输、附件、输出、任务状态和审计数据均保存在本机，网页仅绑定回环地址。
+
+## 组成
+
+- `src/cater/app/` — 应用层：配置、SQLite 迁移与状态机、IMAP/SMTP 适配器、去重/补件、任务编排、发件箱、CLI、本地管理网页、备份/诊断。
+- `src/cater/core/` — 业务转换核心（独立开发），通过 `cater.core.api.process_job` 的 JSON 契约调用；应用不导入其内部类型。
+- `templates/` — 配件台账、整机企业物料/发运沟通表模板。
+- `config/config.example.toml` — 配置样例；实际 `config/config.toml` 不入库。
+- `scripts/` — Windows 安装、启动、备份和计划任务脚本。
+- `docs/operations.md` — 安装、配置、离线演练、常驻运行、补件、备份恢复和故障处理。
+
+## 快速开始（离线）
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+cp config/config.example.toml config/config.toml
+PYTHONPATH=src .venv/bin/python -m cater.app.cli init
+```
+
+在 `config/config.toml` 中把测试发件人加入 `allowlist.test`，保持 `dry_run = true`、`enabled = false`，然后：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cater.app.cli process \
+  --sender tester@example.com --kind parts --destination 法国 \
+  --source "input/配件/1x920_BEECS-6613427.xlsx"
+
+PYTHONPATH=src .venv/bin/python -m cater.app.cli health
+PYTHONPATH=src .venv/bin/python -m cater.app.cli tasks
+```
+
+启动本地管理网页（同时轮询邮箱）：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cater.app.cli serve
+# http://127.0.0.1:8765/
+```
+
+或仅查看界面、不轮询：`serve --no-poll`。
+
+Windows 用户使用 `scripts/install.ps1`、`scripts/run-web.ps1`，详见 [docs/operations.md](docs/operations.md)。部署仅支持完整源码目录 + editable 安装：核心从仓库 `templates/` 读取 Excel 模板，普通 wheel 安装无法找到这些模板；不要用非 editable wheel 部署。
+
+## 邮件与数据规则
+
+- 只处理当前允许名单（`test` 或 `production` 二选一）；离线 `process` 同样受限。
+- 首次扫描默认只建立游标、不处理历史；显式 `poll --history` 才导入首轮历史。
+- 一封邮件对应一类业务；配件读取 xlsx 明细，整机合并 xlsx 与邮件正文表格。
+- 任一必需字段/映射/机型/来源冲突都暂停整票并追问，不交付部分文件。
+- 补件只接受原发起人、可明确关联的邮件，且只解析固定格式：`任务编号`、`目的国`、`国家映射：Alias=FRA`、`修正：record.field=value`、唯一记录时的 `MSO=/SO=`。
+- 同一票重复提交提示已处理；显式重新处理生成新版本并保留旧版本。
+- 发信意图先落库。SMTP 结果不确定进入 `SEND_UNKNOWN`，禁止盲目重发，只能核对已发送文件夹或人工确认。
+- 真实发信需同时满足 `sending.enabled=true`、`dry_run=false`、收件人在当前名单。
+- 凭据只从环境变量或 Windows 凭据管理器读取；日志/诊断/网页均不包含密码，诊断包也不含邮件正文、附件和输出。
+
+## CLI 命令
+
+```text
+version  init  health  tasks  task  outbox  logs  poll  serve  process
+retry  reprocess  confirm-reprocess  deliver  outbox-action  settings
+add-country-alias  import-machines  backup  verify-backup  restore
+cleanup  diagnostics  credentials
+```
+
+完整参数见 `python -m cater.app.cli <command> --help`。
+
+## 测试
+
+测试使用临时 runtime、模拟邮箱和 fake SMTP，不访问真实邮箱：
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+`pyproject.toml` 已设置 `pythonpath = ["src"]`，无需手动导出 `PYTHONPATH`；该命令运行 `tests/` 下的全部应用与核心测试。
+
+本轮测试在 Python 3.13 / macOS 上完成，锁定的业务与测试依赖与实际安装版本一致：`pytest 9.1.1`、`lxml 6.1.1`、`soupsieve 2.9.1`、`openpyxl 3.1.5`、`beautifulsoup4 4.15.0`、`et_xmlfile 2.0.0`。验收机应安装 `.[dev]` 后重跑，并记录 `python -m pytest --version` 的实际输出；上述版本不需要额外升级。
+
+核心样例集成仅读取 `input/` 与 `database/`（不修改），输出写入临时目录。
+
+## 状态
+
+应用层与核心契约已接通；配件 xlsx 和整机 `.msg`（正文表格 + xlsx 附件）均在开发环境通过真实核心离线转换。Windows 计划任务、Windows 凭据管理器、真实 IMAP/SMTP 收发的目标机验收尚未完成，见 `docs/operations.md` 第 11 节。
+
+## 本地业务样例
+
+公开仓库不包含客户原始邮件、发票、箱单和机型数据库，也不包含从邮件提取的完整 HTML 测试副本。`input/`、`output/`、`database/` 及 `tests/core/fixtures/machine_mail.html` 仅保留在本机。样例集成测试依赖这些文件，新环境需自行放置经授权的样例后运行完整测试；模板和程序代码随仓库提供。

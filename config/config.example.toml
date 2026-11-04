@@ -1,0 +1,73 @@
+# CATER 本地邮件驱动出口单证系统 — 示例配置
+#
+# 使用方法：
+#   1. 复制为 config/config.toml（该文件已被 .gitignore 排除）。
+#   2. 按实际邮箱填写。不要在此文件写入密码。
+#   3. IMAP/SMTP 密码通过环境变量 CATER_IMAP_PASSWORD / CATER_SMTP_PASSWORD，
+#      或 Windows 凭据管理器（目标名 Cater/IMAP、Cater/SMTP）提供。
+#
+# 出厂默认：dry-run、不发送、允许名单为空、仅绑定回环地址。
+# 在完成离线演练前，请保持 dry_run = true、enabled = false。
+
+[runtime]
+# 运行数据目录（SQLite、日志、任务文件、备份）。相对路径相对于启动目录。
+dir = "runtime"
+
+[mail]
+# 飞书工作邮箱地址；也是交付邮件的发件人。
+account = "work-mailbox@example.com"
+
+# 邮箱文件夹名称以实际邮箱为准（Outlook/Exchange 常见为 INBOX、Sent Items）。
+folder = "INBOX"
+sent_folder = "Sent"
+
+imap_host = "imap.example.com"
+imap_port = 993
+imap_ssl = true
+imap_starttls = false
+
+smtp_host = "smtp.example.com"
+smtp_port = 465
+smtp_ssl = true
+smtp_starttls = false
+smtp_timeout_seconds = 30
+
+# 轮询间隔（秒）。
+poll_interval_seconds = 60
+
+# 首次运行只建立游标、不处理历史邮件；确认后可临时用 CLI `poll --history`。
+first_run_new_only = true
+
+# 附件限制。超限邮件会留下警告/问题，不会静默截断业务数据。
+max_attachment_bytes = 26214400
+max_total_attachment_bytes = 52428800
+max_message_bytes = 62914560
+
+[allowlist]
+# test 与 production 两套名单相互隔离。
+# 只有当前 mode 对应的名单生效；离线处理同样受此限制。
+mode = "test"
+
+test = [
+  "tester@example.com",
+]
+
+production = []
+
+[sending]
+# 两个开关必须同时放行，且当前允许名单非空，才会真实发信。
+# 保持默认值可完全离线演练。
+dry_run = true
+enabled = false
+
+[web]
+# 仅允许回环地址；不要改成 0.0.0.0。
+host = "127.0.0.1"
+port = 8765
+session_max_age_seconds = 28800
+
+[logging]
+max_bytes = 10485760
+retention_days = 90
+backup_retention = 30
+task_file_retention_days = 365

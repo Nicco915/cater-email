@@ -1,0 +1,43 @@
+# Runtime data: database, mail, task files, logs, backups, diagnostics
+runtime/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Local configuration and secrets
+config/config.toml
+config/*.local.toml
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Office lock files
+~$*
+.~*
+# Local customer source documents and extracted mail (not public code)
+/input/
+/output/
+/database/
+/整机/
+/配件/
+/tests/core/fixtures/machine_mail.html

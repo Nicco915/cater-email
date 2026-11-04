@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}日志 · CATER{% endblock %}
+{% block content %}
+<h1>运行日志</h1>
+<p class="muted">只检索程序生成的 JSONL 日志文件；不会读取任意路径。日志已脱敏并省略邮件正文。</p>
+
+<form class="filters" method="get" action="/logs">
+  <label>关键词 <input type="search" name="query" value="{{ query }}"></label>
+  <label>级别
+    <select name="level">
+      <option value="">全部</option>
+      {% for name in ["INFO", "WARNING", "ERROR", "DEBUG"] %}
+      <option value="{{ name }}" {% if level == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>事件 <input type="text" name="event" value="{{ event }}"></label>
+  <label>任务号 <input type="text" name="task_id" value="{{ task_id }}"></label>
+  <label>邮件号 <input type="text" name="mail_id" value="{{ mail_id }}"></label>
+  <label>条数 <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"></label>
+  <button type="submit">检索</button>
+</form>
+
+{% if records %}
+<table class="grid">
+  <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>任务/邮件</th><th>详情</th></tr></thead>
+  <tbody>
+    {% for record in records %}
+    <tr>
+      <td class="nowrap">{{ record.ts }}</td>
+      <td><span class="badge level-{{ record.level|lower }}">{{ record.level }}</span></td>
+      <td class="mono">{{ record.event }}</td>
+      <td class="mono">{{ record.task_id or record.mail_id or "-" }}</td>
+      <td><details><summary>查看</summary><pre>{{ record | jsonpretty }}</pre></details></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">没有匹配的日志记录。</p>
+{% endif %}
+{% endblock %}

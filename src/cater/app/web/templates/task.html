@@ -1,0 +1,254 @@
+{% extends "base.html" %}
+{% block title %}{{ task.id }} · CATER{% endblock %}
+{% block content %}
+{% set open_issues = issues | selectattr("status", "equalto", "open") | list %}
+{% set has_reprocess_issue = open_issues | selectattr("code", "equalto", "REPROCESS_CONFIRMATION_REQUIRED") | list %}
+
+<div class="page-head">
+  <div>
+    <h1>{{ task.mail_subject or "(无主题)" }}</h1>
+    <div class="muted mono">{{ task.id }}</div>
+  </div>
+  <span class="badge status-{{ task.status|lower }}">{{ task.status }}</span>
+</div>
+
+{% if version != task.version %}
+<div class="notice warn">当前查看历史版本 v{{ version }}；管理操作始终作用于当前版本 v{{ task.version }}。</div>
+{% endif %}
+
+<section class="panel">
+  <h2>操作</h2>
+  <div class="actions">
+    {% if task.status in ["RETRY_PENDING", "FAILED"] %}
+    <form method="post" action="/tasks/{{ task.id }}/retry">
+      {% include "_csrf.html" %}
+      <button type="submit">重试处理</button>
+    </form>
+    {% endif %}
+    {% if task.status not in ["PROCESSING", "VALIDATING", "SEND_UNKNOWN", "CANCELLED"] %}
+    <form method="post" action="/tasks/{{ task.id }}/reprocess">
+      {% include "_csrf.html" %}
+      <button type="submit" name="mode" value="regenerate">仅重新生成</button>
+      <button type="submit" name="mode" value="deliver">重新生成并邮件交付</button>
+    </form>
+    {% endif %}
+    {% if has_reprocess_issue %}
+    <form method="post" action="/tasks/{{ task.id }}/confirm-reprocess">
+      {% include "_csrf.html" %}
+      <button type="submit" class="danger">确认重新处理</button>
+    </form>
+    {% endif %}
+    {% if task.status == "READY_TO_SEND" %}
+    <form method="post" action="/tasks/{{ task.id }}/deliver">
+      {% include "_csrf.html" %}
+      <button type="submit">为当前版本创建交付邮件</button>
+    </form>
+    {% endif %}
+  </div>
+  <p class="muted">“仅重新生成”不会创建新的发件箱记录；需要另行确认“创建交付邮件”。</p>
+</section>
+
+<section class="panel">
+  <h2>概要</h2>
+  <dl class="facts">
+    <dt>发起人</dt><dd>{{ task.owner_name or task.owner }} &lt;{{ task.owner }}&gt;</dd>
+    <dt>业务类型</dt><dd>{{ task.kind }}</dd>
+    <dt>目的国</dt><dd>{{ task.destination_name or "-" }} / {{ task.destination_alpha3 or "-" }}</dd>
+    <dt>当前版本</dt><dd>v{{ task.version }}</dd>
+    <dt>内容哈希</dt><dd class="mono">{{ task.content_hash or "-" }}</dd>
+    <dt>业务身份</dt><dd class="mono">{{ task.business_identity or "-" }}</dd>
+    <dt>最近错误</dt><dd class="pre">{{ task.last_error or "-" }}</dd>
+    <dt>创建 / 更新</dt><dd>{{ task.created_at }} / {{ task.updated_at }}</dd>
+  </dl>
+</section>
+
+<section class="panel">
+  <h2>待解决问题</h2>
+  {% if issues %}
+  <table class="grid">
+    <thead><tr><th>状态</th><th>代码</th><th>记录/字段</th><th>说明</th><th>需要动作</th><th>来源</th></tr></thead>
+    <tbody>
+      {% for issue in issues %}
+      <tr>
+        <td>{{ issue.status }}{% if issue.blocking %} <span class="badge warn">阻塞</span>{% endif %}</td>
+        <td class="mono">{{ issue.code }}</td>
+        <td class="mono">{{ issue.record_key or "-" }} / {{ issue.field or "-" }}</td>
+        <td class="pre">{{ issue.message }}</td>
+        <td class="pre">{{ issue.required_action or "-" }}</td>
+        <td><details><summary>查看</summary><pre>{{ issue.sources | jsonpretty }}</pre></details></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">没有记录问题。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>发件箱</h2>
+  {% if outbox %}
+  <table class="grid">
+    <thead><tr><th>用途</th><th>状态</th><th>收件人</th><th>主题</th><th>尝试</th><th>Message-ID</th><th>操作</th></tr></thead>
+    <tbody>
+      {% for item in outbox %}
+      <tr>
+        <td>{{ item.purpose }}</td>
+        <td><span class="badge status-{{ item.status|replace('_', '-') }}">{{ item.status }}</span>
+          {% if item.last_error %}<div class="muted pre">{{ item.last_error }}</div>{% endif %}</td>
+        <td>{{ item.recipient }}</td>
+        <td>{{ item.subject|shorten(70) }}</td>
+        <td>{{ item.attempts }}</td>
+        <td class="mono">{{ item.message_id }}</td>
+        <td class="actions">
+          {% if item.status == "dry_run" %}
+          <form method="post" action="/outbox/{{ item.id }}/release">{% include "_csrf.html" %}<button type="submit">放行发送</button></form>
+          {% elif item.status == "failed" %}
+          <form method="post" action="/outbox/{{ item.id }}/retry">{% include "_csrf.html" %}<button type="submit">重试发送</button></form>
+          {% elif item.status == "send_unknown" %}
+          <form method="post" action="/outbox/{{ item.id }}/recheck">{% include "_csrf.html" %}<button type="submit">核对已发送</button></form>
+          <form method="post" action="/outbox/{{ item.id }}/confirm-sent">{% include "_csrf.html" %}<button type="submit">确认已发送</button></form>
+          <form method="post" action="/outbox/{{ item.id }}/confirm-not-sent">{% include "_csrf.html" %}<button type="submit" class="danger">确认未发送</button></form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">尚未创建发件箱记录。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>输出文件</h2>
+  {% if artifacts %}
+  <table class="grid">
+    <thead><tr><th>文件</th><th>类型</th><th>大小</th><th>SHA-256</th><th>下载</th></tr></thead>
+    <tbody>
+      {% for artifact in artifacts %}
+      <tr>
+        <td>{{ artifact.filename }}</td>
+        <td>{{ artifact.kind or "-" }}</td>
+        <td>{{ artifact.size_bytes }}</td>
+        <td class="mono">{{ artifact.sha256|shorten(24) }}</td>
+        <td><a class="button" href="/artifacts/{{ artifact.id }}">下载</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">当前版本没有输出文件。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>输入</h2>
+  {% if inputs %}
+  <table class="grid">
+    <thead><tr><th>文件</th><th>类型</th><th>大小</th><th>哈希</th><th>邮件</th></tr></thead>
+    <tbody>
+      {% for item in inputs %}
+      <tr>
+        <td>{{ item.filename }}</td>
+        <td>{{ item.source_type }}</td>
+        <td>{{ item.size_bytes }}</td>
+        <td class="mono">{{ item.file_hash|shorten(24) }}</td>
+        <td class="mono">{{ item.mail_id or "-" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">当前版本没有输入文件。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>补充修正（overrides）</h2>
+  {% if overrides %}
+  <table class="grid">
+    <thead><tr><th>记录</th><th>字段</th><th>值</th><th>来源邮件</th><th>时间</th></tr></thead>
+    <tbody>
+      {% for item in overrides %}
+      <tr><td class="mono">{{ item.record_key }}</td><td class="mono">{{ item.field }}</td><td class="pre">{{ item.value }}</td><td class="mono">{{ item.source_message_id or "-" }}</td><td>{{ item.created_at }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">没有补充修正。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>版本</h2>
+  <table class="grid">
+    <thead><tr><th>版本</th><th>状态</th><th>明细数</th><th>内容哈希</th><th>输出目录</th><th>处理时间</th></tr></thead>
+    <tbody>
+      {% for item in versions %}
+      <tr>
+        <td><a href="/tasks/{{ task.id }}?version={{ item.version }}">v{{ item.version }}</a></td>
+        <td>{{ item.status }}</td>
+        <td>{{ item.record_count }}</td>
+        <td class="mono">{{ item.content_hash|shorten(24) }}</td>
+        <td class="mono">{{ item.output_dir or "-" }}</td>
+        <td>{{ item.processed_at or "-" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>字段来源</h2>
+  {% if provenance %}
+  <table class="grid">
+    <thead><tr><th>记录</th><th>字段</th><th>值</th><th>来源</th><th>来源定位</th></tr></thead>
+    <tbody>
+      {% for item in provenance %}
+      <tr>
+        <td class="mono">{{ item.record_key or "-" }}</td>
+        <td class="mono">{{ item.field or "-" }}</td>
+        <td class="pre">{{ item.value | jsonpretty }}</td>
+        <td>{{ item.source_kind or "-" }}</td>
+        <td><details><summary>查看</summary><pre>{{ item.source_ref | jsonpretty }}</pre></details></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">没有字段来源记录。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>邮件</h2>
+  {% if mails %}
+  <table class="grid">
+    <thead><tr><th>方向</th><th>发件人</th><th>主题</th><th>Message-ID</th><th>过滤原因</th><th>时间</th></tr></thead>
+    <tbody>
+      {% for mail in mails %}
+      <tr>
+        <td>{{ mail.direction }}</td>
+        <td>{{ mail.sender }}</td>
+        <td>{{ mail.subject or "(无主题)" }}</td>
+        <td class="mono">{{ mail.message_id or "-" }}</td>
+        <td>{{ mail.filter_reason or "-" }}</td>
+        <td>{{ mail.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">没有关联邮件。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>事件</h2>
+  {% if events %}
+  <table class="grid">
+    <thead><tr><th>时间</th><th>版本</th><th>阶段</th><th>状态变化</th><th>代码</th><th>操作者</th><th>详情</th></tr></thead>
+    <tbody>
+      {% for event in events %}
+      <tr>
+        <td class="nowrap">{{ event.created_at }}</td>
+        <td>v{{ event.version }}</td>
+        <td>{{ event.stage }}</td>
+        <td>{{ event.from_status or "-" }} → {{ event.to_status or "-" }}</td>
+        <td class="mono">{{ event.code or "-" }}</td>
+        <td>{{ event.actor }}</td>
+        <td><details><summary>查看</summary><pre>{{ event.detail | jsonpretty }}</pre></details></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">没有事件。</p>{% endif %}
+</section>
+{% endblock %}

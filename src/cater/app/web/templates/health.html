@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}健康 · CATER{% endblock %}
+{% block content %}
+<h1>健康状态</h1>
+
+<section class="panel">
+  <h2>数据库</h2>
+  <dl class="facts">
+    <dt>结构版本</dt><dd>{{ health.schema_version }}</dd>
+    <dt>quick_check</dt><dd class="mono">{{ health.quick_check }}</dd>
+    <dt>发件结果不确定</dt><dd>{{ health.outbox_unknown }}</dd>
+    <dt>账号已配置</dt><dd>{{ "是" if health.account_configured else "否" }}</dd>
+  </dl>
+</section>
+
+<section class="panel">
+  <h2>任务计数</h2>
+  <div class="chips">
+    {% for name, count in health.tasks.items() %}
+    <a class="chip status-{{ name|lower }}" href="/?status={{ name }}">{{ name }} {{ count }}</a>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>配置与凭证</h2>
+  <dl class="facts">
+    <dt>dry-run</dt><dd>{{ "是（不发信）" if health.dry_run else "否" }}</dd>
+    <dt>发送开关</dt><dd>{{ "启用" if health.sending_enabled else "关闭" }}</dd>
+    <dt>允许名单模式</dt><dd>{{ health.allowlist_mode }}</dd>
+    <dt>生效允许地址数</dt><dd>{{ health.active_allowlist_count }}</dd>
+    <dt>IMAP / SMTP 主机</dt><dd>{{ "已配置" if health.imap_host_configured else "未配置" }} / {{ "已配置" if health.smtp_host_configured else "未配置" }}</dd>
+  </dl>
+  <h3>凭证存在性（仅布尔值）</h3>
+  <dl class="facts">
+    {% for key, value in health.credential_presence.items() %}
+    <dt>{{ key }}</dt><dd>{{ "已配置" if value else "未检测到" }}</dd>
+    {% endfor %}
+  </dl>
+</section>
+
+<section class="panel">
+  <h2>启动恢复</h2>
+  <pre>{{ recovery | jsonpretty }}</pre>
+</section>
+
+<section class="panel">
+  <h2>最近备份</h2>
+  {% if backups %}
+  <table class="grid">
+    <thead><tr><th>文件</th><th>大小</th><th>修改时间</th></tr></thead>
+    <tbody>
+      {% for backup in backups %}
+      <tr><td class="mono">{{ backup.name }}</td><td>{{ backup.size }}</td><td>{{ backup.modified | epoch }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">尚无备份。可运行 <span class="mono">cater-app backup</span>。</p>{% endif %}
+</section>
+{% endblock %}

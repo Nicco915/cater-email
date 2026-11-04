@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}诊断 · CATER{% endblock %}
+{% block content %}
+<h1>诊断包</h1>
+<div class="notice">
+  诊断包包含任务摘要、问题、已脱敏日志和配置布尔摘要；不包含凭证、邮件正文或附件内容。
+  生成后通过本地下载获取，不会自动上传。
+</div>
+
+<section class="panel">
+  <form method="post" action="/diagnostics">
+    {% include "_csrf.html" %}
+    <button type="submit">生成并下载诊断包</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>最近生成的诊断包</h2>
+  {% if files %}
+  <table class="grid">
+    <thead><tr><th>文件</th><th>大小</th><th>修改时间</th><th>下载</th></tr></thead>
+    <tbody>
+      {% for file in files %}
+      <tr>
+        <td class="mono">{{ file.name }}</td>
+        <td>{{ file.size }}</td>
+        <td>{{ file.modified | epoch }}</td>
+        <td><a class="button" href="/diagnostics/files/{{ file.name }}">下载</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="empty">尚未生成诊断包。</p>{% endif %}
+</section>
+{% endblock %}
