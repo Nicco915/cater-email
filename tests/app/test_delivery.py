@@ -242,3 +242,26 @@ def test_explicit_same_content_reprocess_creates_new_delivery(
     assert len({row["dedupe_key"] for row in deliveries}) == 2
     assert len(gateway.sent) == 2
     assert all(message.attachments for message in gateway.sent)
+
+def test_destination_question_is_short_and_actionable(service):
+    task = {'id': 'task_example123', 'version': 1, 'kind': 'auto'}
+    body = service.delivery.question_body(task, [{
+        'code': 'DESTINATION_MISSING', 'field': 'destination',
+        'message': 'No destination was provided', 'required_action': 'Reply using structured fields'}])
+    assert '目的国：法国' in body
+    assert '这票货物的目的国' in body
+    assert 'DESTINATION_MISSING' not in body
+    assert 'No destination' not in body
+    assert '国家映射' not in body and 'MSO=' not in body and '确认重新处理' not in body
+    assert len(body.splitlines()) < 18
+
+
+def test_conflict_question_shows_values_and_only_relevant_reply(service):
+    task = {'id': 'task_example123', 'version': 1}
+    body = service.delivery.question_body(task, [{
+        'code': 'FIELD_CONFLICT', 'record_key': 'BFWVU', 'field': 'total_sales_price',
+        'message': '字段 total_sales_price 两来源不一致：68822.84 ≠ 69847.84'}])
+    assert '机器销售价格' in body
+    assert '68822.84 ≠ 69847.84' in body
+    assert '修正：BFWVU.total_sales_price=' in body
+    assert '目的国：法国' not in body

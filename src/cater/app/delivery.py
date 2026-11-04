@@ -122,42 +122,65 @@ class DeliveryService:
     # questions
     # ------------------------------------------------------------------
     def question_body(self, task: dict[str, Any], issues: list[dict[str, Any]]) -> str:
-        marker = task_marker(str(task["id"]), int(task["version"]))
-        lines = [
-            f"{marker} 需要补充资料",
-            "",
-            "您好：",
-            "",
-            "本地处理程序暂停了该任务，未生成或发送部分业务文件。",
-            f"任务编号：{task['id']}",
-            f"业务类型：{KIND_LABELS.get(str(task['kind']), str(task['kind']))}",
-            f"目的国：{task.get('destination_name') or '未提供'}",
-            "",
-            "待解决的问题：",
-        ]
+        lines = ["您好：", "", "这票资料还需要您确认以下内容，暂未发送结果文件。", ""]
+        examples: list[str] = []
+        labels = {
+            "dealer_code": "经销商代码", "dealer_order": "客户订单号", "order": "SO订单号",
+            "material": "机型", "model": "机型", "serial_number": "机器序列号",
+            "total_sales_price": "机器销售价格", "net_weight": "净重", "qty": "数量",
+            "part_code": "商品料号", "coo": "原产国", "destination": "目的国",
+            "unit_price": "单价", "hs_code": "商品编码",
+        }
         for issue in issues:
-            code = issue.get("code") or "ISSUE"
-            record = issue.get("record_key") or "-"
-            field = issue.get("field") or "-"
-            lines.append(f"- [{code}] 记录 {record} / 字段 {field}：{issue.get('message') or ''}")
-            if issue.get("required_action"):
-                lines.append(f"  需要：{issue['required_action']}")
-        lines.extend(
-            [
-                "",
-                "请仅使用以下规范格式回复（不要使用模糊描述）：",
-                "  确认重新处理（仅需重新校验和交付时单独一行回复，不与修正混用）",
-                "  目的国：法国",
-                "  国家映射：France=FRA",
-                "  修正：<record_key>.<field>=<value>",
-                f"  任务编号：{task['id']}",
-                "",
-                "同一记录只有一个待解决问题时，也可使用：MSO=...；SO=...",
-                "请保留本主题中的任务标记，或回复本邮件以保持关联。",
-                "",
-                "此邮件由本地程序自动发送；不会声称已上传任何业务系统。",
-            ]
-        )
+            code = str(issue.get("code") or "")
+            record = issue.get("record_key")
+            field = str(issue.get("field") or "")
+            prefix = f"编号 {record}：" if record else ""
+            if code == "DESTINATION_MISSING":
+                lines.append("- 请告诉我们这票货物的目的国。")
+                examples.append("目的国：法国")
+            elif code == "DESTINATION_UNKNOWN" or (code in {"UNKNOWN_COUNTRY", "COUNTRY_UNKNOWN", "COUNTRY_MAPPING_MISSING"} and field == "destination"):
+                lines.append("- 国家名称暂时无法识别，请提供标准国家名称。")
+                examples.append("目的国：法国")
+            elif code == "REPROCESS_CONFIRMATION_REQUIRED":
+                lines.append("- 这票货物之前处理过，本次资料有变化，请确认是否重新处理。")
+                examples.append("确认重新处理")
+            elif code == "MISSING_FIELD" or code.startswith("MISSING_"):
+                fields = [item.strip() for item in field.split(",") if item.strip()]
+                names = "、".join(labels.get(item, "业务信息") for item in fields) or "业务信息"
+                lines.append(f"- {prefix}缺少{names}，请补充。")
+                if record and fields:
+                    for name in fields:
+                        value = "4" if name == "qty" else "请填写正确值"
+                        examples.append(f"修正：{record}.{name}={value}")
+                else:
+                    lines.append("  请联系处理人员核对该项资料，再按提示补充。")
+            elif code == "FIELD_CONFLICT":
+                message = str(issue.get("message") or "")
+                lines.append(f"- {prefix}{labels.get(field, '资料')}在邮件与附件中不一致，请确认正确值。")
+                # Preserve useful business values without dumping internal source objects.
+                if "不一致：" in message:
+                    lines.append("  两处填写分别为：" + message.split("不一致：", 1)[1])
+                if record and field:
+                    examples.append(f"修正：{record}.{field}=请填写正确值")
+            elif "MODEL" in code or "MACHINE" in code or "SPECIAL_RULE" in code:
+                lines.append(f"- {prefix}机型或特殊申报资料尚未确认，请联系资料维护人员核对。")
+            elif "ATTACHMENT" in code or "WORKBOOK" in code or "SHEET" in code or "UNSUPPORTED" in code:
+                lines.append("- 附件或工作表无法使用，请回复正确、完整且未加密的 Excel 文件。")
+            elif "MAPPING" in code or "COUNTRY" in code:
+                lines.append(f"- {prefix}国家对应关系需要确认，请联系资料维护人员核对国家代码。")
+            else:
+                lines.append(f"- {prefix}资料暂时无法通过检查，请联系处理人员核对本票资料。")
+        examples = list(dict.fromkeys(examples))
+        if examples:
+            lines.extend(["", "请直接回复本邮件，按下面格式填写实际内容：", ""])
+            lines.extend(examples)
+            if any("请填写正确值" in item for item in examples):
+                lines.append("（保留等号前的内容，把等号后的文字换成正确值。）")
+            elif examples == ["目的国：法国"]:
+                lines.append("（把“法国”换成这票货物实际的目的国。）")
+        lines.extend(["", "请保留邮件主题。收到补充后，我们会继续检查并处理。",
+                      "", f"查询编号：{task['id']}"])
         return "\n".join(lines)
 
     def enqueue_question(

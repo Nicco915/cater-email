@@ -63,6 +63,7 @@ def validate_core_response(response: Any, *, output_dir: Path) -> dict[str, Any]
     if status == "ready" and not response.get("content_hash"):
         raise ValidationError("core returned ready without content_hash")
 
+    output_dir = output_dir.resolve()
     artifacts: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
     for raw in artifacts_raw:
@@ -70,7 +71,10 @@ def validate_core_response(response: Any, *, output_dir: Path) -> dict[str, Any]
             raise ValidationError("each artifact must have a path")
         path = Path(str(raw["path"]))
         if not path.is_absolute():
-            path = output_dir / path
+            # Core may return either an output-relative filename or a cwd-relative
+            # path already containing runtime/tasks/.../outputs. Never prefix twice.
+            from_cwd = path.resolve()
+            path = from_cwd if is_within(from_cwd, output_dir) else output_dir / path
         path = path.resolve()
         if not is_within(path, output_dir):
             raise ValidationError("core artifact path escapes the task output directory")

@@ -862,7 +862,7 @@ class AppService:
     # processing helpers
     # ------------------------------------------------------------------
     def _version_dir(self, task_id: str, version: int) -> Path:
-        return self.config.tasks_dir / task_id / f"v{version}"
+        return (self.config.tasks_dir / task_id / f"v{version}").resolve()
 
     def _output_dir(self, task_id: str, version: int) -> Path:
         return self._version_dir(task_id, version) / "outputs"
