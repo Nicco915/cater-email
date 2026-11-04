@@ -133,6 +133,9 @@ class AppService:
         )
         self._reference_importer = reference_importer
         self.recovery_report: dict[str, Any] = {}
+        # Global, task-less poll failures (for example IMAP down) surface only
+        # here and in the logs; they never trigger customer-facing mail.
+        self.last_poll_error: str | None = None
         self.maintenance = MaintenanceService(
             db=self.db,
             config=config,
@@ -158,16 +161,14 @@ class AppService:
         uncertain_outbox = self.outbox.recover_sending()
         send_unknown_tasks: list[str] = []
         for row in uncertain_outbox:
-            try:
+            if row["task_id"]:
                 self.tasks.add_event(
                     str(row["task_id"]),
                     stage="recovery",
                     code="send_uncertain_after_restart",
                     detail={"outbox_id": row["id"]},
                 )
-            except Exception:
-                pass
-            if row["purpose"] == "delivery":
+            if row["purpose"] == "delivery" and row["task_id"]:
                 task = self.tasks.get(str(row["task_id"]))
                 if task is not None and task["status"] == state.READY_TO_SEND:
                     try:
@@ -261,11 +262,15 @@ class AppService:
     def health(self) -> dict[str, Any]:
         effective = self.settings.current()
         credentials = self.credentials.describe(self.config.mail.account)
+        task_counts = self.tasks.counts()
         return {
             "schema_version": self.db.schema_version(),
             "quick_check": self.db.quick_check(),
-            "tasks": self.tasks.counts(),
+            "tasks": task_counts,
             "outbox_unknown": len(self.outbox.unknown()),
+            "retry_pending": task_counts.get(state.RETRY_PENDING, 0),
+            "failed": task_counts.get(state.FAILED, 0),
+            "last_poll_error": self.last_poll_error,
             "dry_run": effective.sending.dry_run,
             "sending_enabled": effective.sending.enabled,
             "allowlist_mode": effective.allowlist.mode,
@@ -284,16 +289,105 @@ class AppService:
         result = self.intake.ingest(raw_message)
         if result.reprocess_requested and result.task_id:
             self.reprocess_task(result.task_id, actor="mail-owner")
+        elif result.retry_command and result.task_id:
+            self._mail_retry(result.task_id)
         elif result.should_process and result.task_id:
             self.process_task(result.task_id, actor="intake")
             task = self.tasks.require(result.task_id)
             if task["status"] == state.WAITING_INPUT:
                 result.waiting = True
+        if result.status_query and result.task_id:
+            self._answer_status_query(result.task_id, result.mail_id)
+        if result.retry_waiting and result.task_id:
+            self._answer_retry_waiting(result.task_id, result.mail_id)
         if result.needs_question and result.task_id:
             task = self.tasks.require(result.task_id)
-            if task["status"] == state.WAITING_INPUT:
-                self._enqueue_question_and_dispatch(task, actor="intake")
+            self._enqueue_question_and_dispatch(task, actor="intake")
+        if result.notice and result.task_id:
+            self._send_guidance_notice(result)
+        if result.guidance:
+            self._send_taskless_guidance(result)
         return result
+
+    def _send_taskless_guidance(self, result: IngestResult) -> None:
+        """Persist generic guidance for a mail that links to no task.
+
+        Uses the same outbox/dry-run/allowlist pipeline as task mail; the
+        dedupe key is the querying mail's fingerprint, so redelivery never
+        triggers a second guidance message.
+        """
+
+        mail = self.mail_store.get(result.mail_id)
+        if mail is None:
+            return
+        recipient = normalize_email(str(mail.get("sender") or ""))
+        fingerprint = str(mail.get("raw_hash") or mail.get("message_id") or result.mail_id)
+        message_id = str(mail.get("message_id") or "")
+        try:
+            row, _ = self.delivery.enqueue_guidance(
+                recipient=recipient,
+                recipient_name=mail.get("sender_name"),
+                subject=f"Re: {str(mail.get('subject') or '操作指引')}",
+                body=str(result.guidance),
+                in_reply_to=message_id or None,
+                references=[message_id] if message_id else [],
+                dedupe_key=f"guidance:{fingerprint}",
+            )
+        except Exception as exc:
+            self.logger.exception("taskless_guidance_failed", exc, mail_id=result.mail_id)
+            return
+        self._dispatch_if_pending(row, actor="intake")
+
+    def _answer_retry_waiting(self, task_id: str, mail_id: str) -> None:
+        task = self.tasks.require(task_id)
+        open_issues = [
+            issue for issue in self.tasks.issues(task_id) if issue["status"] == "open"
+        ]
+        try:
+            row, _ = self.delivery.enqueue_retry_waiting_answer(
+                task, command_mail_id=mail_id, open_issues=open_issues
+            )
+        except Exception as exc:
+            self.logger.exception("retry_waiting_answer_failed", exc, task_id=task_id)
+            return
+        self._dispatch_if_pending(row, actor="intake")
+
+    def _mail_retry(self, task_id: str) -> dict[str, Any]:
+        """Owner-initiated retry: same version, same inputs, new failure episode."""
+
+        self.tasks.reset_retry_budget(task_id)
+        return self.process_task(task_id, actor="mail-owner")
+
+    def _answer_status_query(self, task_id: str, mail_id: str) -> None:
+        """Read-only status answer; never recalculates or changes the task."""
+
+        task = self.tasks.require(task_id)
+        open_issues = [
+            issue for issue in self.tasks.issues(task_id) if issue["status"] == "open"
+        ]
+        try:
+            row, _ = self.delivery.enqueue_status_report(
+                task, query_mail_id=mail_id, open_issues=open_issues
+            )
+        except Exception as exc:
+            self.logger.exception("status_report_failed", exc, task_id=task_id)
+            return
+        self._dispatch_if_pending(row, actor="intake")
+
+    def _send_guidance_notice(self, result: IngestResult) -> None:
+        task = self.tasks.require(str(result.task_id))
+        try:
+            row, _ = self.delivery.enqueue_notice(
+                task,
+                body=str(result.notice),
+                dedupe_suffix=str(result.notice_suffix or "guidance"),
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "guidance_notice_failed", exc, task_id=result.task_id
+            )
+            return
+        self._dispatch_if_pending(row, actor="intake")
 
     def poll_once(self, *, include_history: bool = False) -> PollReport:
         account = self.config.mail.account
@@ -415,6 +509,7 @@ class AppService:
             first_scan_completed=True,
         )
         self.logger.info("mail_scan_completed", **report.as_dict())
+        self.last_poll_error = "; ".join(report.errors) or None
         return report
 
     # ------------------------------------------------------------------
@@ -501,6 +596,7 @@ class AppService:
                 ),
             }
             self.tasks.replace_issues(task_id, version, [issue])
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.WAITING_INPUT,
@@ -523,6 +619,7 @@ class AppService:
                 "required_action": "Reply with 目的国：<known name> or 国家映射：<alias>=<alpha3>.",
             }
             self.tasks.replace_issues(task_id, version, [issue])
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.WAITING_INPUT,
@@ -541,14 +638,16 @@ class AppService:
             self.logger.exception(
                 "task_request_build_failed", exc, task_id=task_id, version=version
             )
-            return self.tasks.set_retry_state(
+            # Unreadable/missing saved inputs do not heal by waiting; stop
+            # instead of burning the retry budget, and tell the owner once.
+            return self._record_processing_failure(
                 task_id,
-                status=state.RETRY_PENDING,
                 error=f"{type(exc).__name__}: {exc}",
                 stage="processing",
                 actor=actor,
                 attempt_id=attempt_id,
                 code="request_build_failed",
+                recoverable=False,
             )
 
         try:
@@ -557,14 +656,14 @@ class AppService:
             self.logger.error(
                 "core_unavailable", task_id=task_id, version=version, error=str(exc)
             )
-            return self.tasks.set_retry_state(
+            return self._record_processing_failure(
                 task_id,
-                status=state.RETRY_PENDING,
                 error=str(exc),
                 stage="processing",
                 actor=actor,
                 attempt_id=attempt_id,
                 code="core_unavailable",
+                recoverable=True,
             )
         except Exception as exc:
             self.logger.exception(
@@ -574,14 +673,14 @@ class AppService:
                 version=version,
                 attempt_id=attempt_id,
             )
-            return self.tasks.set_retry_state(
+            return self._record_processing_failure(
                 task_id,
-                status=state.RETRY_PENDING,
                 error=f"{type(exc).__name__}: {exc}",
                 stage="processing",
                 actor=actor,
                 attempt_id=attempt_id,
                 code="core_processing_error",
+                recoverable=True,
             )
 
         output_dir = self._output_dir(task_id, version)
@@ -595,14 +694,14 @@ class AppService:
                 version=version,
                 attempt_id=attempt_id,
             )
-            return self.tasks.set_retry_state(
+            return self._record_processing_failure(
                 task_id,
-                status=state.RETRY_PENDING,
                 error=f"invalid core response: {exc}",
                 stage="validation",
                 actor=actor,
                 attempt_id=attempt_id,
                 code="invalid_core_response",
+                recoverable=True,
             )
 
         self.tasks.set_kind(task_id, str(response["kind"]), actor=actor)
@@ -633,6 +732,7 @@ class AppService:
 
         response_status = str(response["status"])
         if response_status == "waiting_input":
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.WAITING_INPUT,
@@ -664,6 +764,7 @@ class AppService:
                 }
             ]
             self.tasks.replace_issues(task_id, version, issues)
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.WAITING_INPUT,
@@ -692,6 +793,7 @@ class AppService:
                 state.SEND_UNKNOWN,
             }
         ):
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.COMPLETED,
@@ -725,6 +827,7 @@ class AppService:
                 state.SEND_UNKNOWN,
             }
         ):
+            self.tasks.reset_retry_budget(task_id)
             self.tasks.transition(
                 task_id,
                 state.COMPLETED,
@@ -808,6 +911,7 @@ class AppService:
                 )
                 return self.tasks.require(task_id)
 
+        self.tasks.reset_retry_budget(task_id)
         self.tasks.transition(
             task_id,
             state.READY_TO_SEND,
@@ -856,6 +960,58 @@ class AppService:
             record_count=len(response["records"]),
             artifact_count=len(artifacts),
         )
+        return self.tasks.require(task_id)
+
+    def _record_processing_failure(
+        self,
+        task_id: str,
+        *,
+        error: str,
+        stage: str,
+        actor: str,
+        attempt_id: str,
+        code: str,
+        recoverable: bool,
+    ) -> dict[str, Any]:
+        """Persist a technical failure, schedule bounded retry and notify once.
+
+        Recoverable failures consume the automatic retry budget with backoff;
+        once it is exhausted the task becomes FAILED. The owner receives one
+        persisted notice per failure episode (an explicit user/admin retry
+        starts a new episode via ``reset_retry_budget``). Non-recoverable
+        failures (for example unreadable saved inputs) stop immediately.
+        """
+
+        status = state.RETRY_PENDING if recoverable else state.FAILED
+        task = self.tasks.set_retry_state(
+            task_id,
+            status=status,
+            error=error,
+            stage=stage,
+            actor=actor,
+            attempt_id=attempt_id,
+            code=code,
+            count_attempt=recoverable,
+        )
+        if task["status"] == state.FAILED and not int(task.get("failure_notified") or 0):
+            try:
+                notice, _ = self.delivery.enqueue_failure_notice(
+                    task,
+                    episode=int(task.get("failure_seq") or 0) + 1,
+                    exhausted=recoverable,
+                )
+                self.tasks.mark_failure_notified(task_id)
+                self._dispatch_if_pending(notice, actor=actor)
+                self.logger.warning(
+                    "task_failure_notified",
+                    task_id=task_id,
+                    version=int(task["version"]),
+                    code=code,
+                )
+            except Exception as exc:
+                self.logger.exception(
+                    "failure_notice_failed", exc, task_id=task_id
+                )
         return self.tasks.require(task_id)
 
     # ------------------------------------------------------------------
@@ -1058,6 +1214,7 @@ class AppService:
         task = self.tasks.require(task_id)
         if task["status"] not in {state.RETRY_PENDING, state.FAILED}:
             raise StateTransitionError("Only RETRY_PENDING or FAILED tasks can be retried")
+        self.tasks.reset_retry_budget(task_id)
         return self.process_task(task_id, actor=actor)
 
     def reprocess_task(

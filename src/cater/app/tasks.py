@@ -10,7 +10,23 @@ from typing import Any, Iterable
 from . import state
 from .db import Database
 from .logging import JsonlLogger
-from .util import new_id, utc_now
+from .util import new_id, normalize_key, utc_now
+
+# Automatic retry policy for recoverable technical failures. ``retry_count``
+# counts consecutive technical failures without a successful business outcome;
+# while it stays below MAX_AUTO_RETRIES the poller re-attempts with backoff,
+# afterwards the task becomes FAILED and the owner is notified exactly once
+# per failure episode (``failure_notified``). Both counters persist in the
+# database, so a process restart neither resets nor re-notifies.
+MAX_AUTO_RETRIES = 3
+RETRY_BACKOFF_SECONDS = (60, 300, 900)
+
+
+def retry_backoff_seconds(failure_number: int) -> int:
+    """Delay before retrying after ``failure_number`` consecutive failures."""
+
+    index = max(1, min(int(failure_number), len(RETRY_BACKOFF_SECONDS))) - 1
+    return RETRY_BACKOFF_SECONDS[index]
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -344,9 +360,33 @@ class TaskRepository:
         code: str = "processing_error",
         detail: dict[str, Any] | None = None,
         next_retry_at: str | None = None,
+        count_attempt: bool = True,
     ) -> dict[str, Any]:
+        """Record a processing failure and schedule or exhaust automatic retry.
+
+        ``RETRY_PENDING`` consumes retry budget: the consecutive-failure
+        counter is incremented and, once it exceeds ``MAX_AUTO_RETRIES``, the
+        task moves to ``FAILED`` instead (no further automatic attempts).
+        ``FAILED`` records the terminal failure without scheduling. Both
+        transitions are audited; the caller is responsible for notifying the
+        owner when the returned task is ``FAILED`` and not yet
+        ``failure_notified``.
+        """
+
         if status not in {state.RETRY_PENDING, state.FAILED, state.WAITING_INPUT}:
             raise ValueError(status)
+        now = utc_now()
+        failures = 0
+        if count_attempt:
+            with self.db.transaction() as conn:
+                row = conn.execute(
+                    "SELECT retry_count FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(task_id)
+                failures = int(row["retry_count"]) + 1
+            if status == state.RETRY_PENDING and failures > MAX_AUTO_RETRIES:
+                status = state.FAILED
         result = self.transition(
             task_id,
             status,
@@ -356,15 +396,54 @@ class TaskRepository:
             code=code,
             detail=detail,
         )
-        if status == state.RETRY_PENDING and next_retry_at is None:
-            next_retry_at = (
-                datetime.now(timezone.utc) + timedelta(minutes=5)
-            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        if status == state.RETRY_PENDING:
+            if count_attempt:
+                if next_retry_at is None:
+                    from datetime import timedelta
+
+                    next_retry_at = (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=retry_backoff_seconds(failures))
+                    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                self.db.insert(
+                    "UPDATE tasks SET retry_count = ?, last_error = ?, next_retry_at = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (failures, error[:4000], next_retry_at, utc_now(), task_id),
+                )
+            else:
+                self.db.insert(
+                    "UPDATE tasks SET last_error = ?, next_retry_at = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (error[:4000], next_retry_at, utc_now(), task_id),
+                )
+        else:
+            self.db.insert(
+                "UPDATE tasks SET retry_count = ?, last_error = ?, next_retry_at = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    failures if status == state.FAILED else 0,
+                    error[:4000],
+                    utc_now(),
+                    task_id,
+                ),
+            )
+        return self.require(task_id)
+
+    def reset_retry_budget(self, task_id: str) -> None:
+        """Start a new failure episode after an explicit user/admin retry."""
+
         self.db.insert(
-            "UPDATE tasks SET last_error = ?, next_retry_at = ?, updated_at = ? WHERE id = ?",
-            (error[:4000], next_retry_at, utc_now(), task_id),
+            "UPDATE tasks SET retry_count = 0, failure_notified = 0, updated_at = ? "
+            "WHERE id = ?",
+            (utc_now(), task_id),
         )
-        return result
+
+    def mark_failure_notified(self, task_id: str) -> None:
+        self.db.insert(
+            "UPDATE tasks SET failure_notified = 1, failure_seq = failure_seq + 1, "
+            "updated_at = ? WHERE id = ?",
+            (utc_now(), task_id),
+        )
 
     def due_for_retry(self, limit: int = 10) -> list[str]:
         now = utc_now()
@@ -389,9 +468,16 @@ class TaskRepository:
     # versions / inputs
     # ------------------------------------------------------------------
     def start_next_version(
-        self, task_id: str, *, actor: str, reason: str, copy_inputs: bool = True
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        reason: str,
+        copy_inputs: bool = True,
+        exclude_filenames: Iterable[str] = (),
     ) -> dict[str, Any]:
         now = utc_now()
+        excluded = {normalize_key(name) for name in exclude_filenames}
         with self.db.transaction() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
@@ -409,7 +495,8 @@ class TaskRepository:
                 """
                 UPDATE tasks SET version = ?, updated_at = ?,
                                  reprocess_confirmed = 0, content_hash = NULL,
-                                 business_identity = NULL, last_error = NULL
+                                 business_identity = NULL, last_error = NULL,
+                                 retry_count = 0, failure_notified = 0
                  WHERE id = ?
                 """,
                 (new_version, now, task_id),
@@ -420,6 +507,10 @@ class TaskRepository:
                     (task_id, old_version),
                 ).fetchall()
                 for source in rows:
+                    if normalize_key(str(source["filename"])) in excluded:
+                        # A same-name supplement replaces this input for the
+                        # new version only; the old version row and file stay.
+                        continue
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO task_inputs (
@@ -497,6 +588,201 @@ class TaskRepository:
                     utc_now(),
                 ),
             )
+
+    def apply_supplement(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        reason: str,
+        exclude_filenames: Iterable[str] = (),
+        aliases: Iterable[tuple[str, str, str]] = (),
+        destination: tuple[str, str] | None = None,
+        overrides: Iterable[dict[str, Any]] = (),
+        inputs: Iterable[dict[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Apply a full owner supplement in ONE database transaction.
+
+        Writes country aliases (with audit rows), starts the next task
+        version (copying inputs except replaced file names), updates the
+        destination, stores overrides and registers the new input rows. If
+        anything fails, the transaction rolls back: the previously active
+        version, its inputs and the reference configuration remain exactly
+        as they were. ``aliases`` items are pre-validated
+        ``(alias_norm, alias_raw, alpha3)`` tuples.
+        """
+
+        excluded = {normalize_key(name) for name in exclude_filenames}
+        now = utc_now()
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            old_version = int(row["version"])
+            new_version = old_version + 1
+
+            for alias_norm, alias_raw, alpha3 in aliases:
+                existing = conn.execute(
+                    "SELECT 1 FROM country_aliases WHERE alias_norm = ?", (alias_norm,)
+                ).fetchone()
+                if existing is not None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO country_aliases(alias_norm, alpha3, alias_raw, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (alias_norm, alpha3, alias_raw, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO config_versions(key, value_json, previous_json, actor, reason, created_at)
+                    VALUES (?, ?, NULL, ?, ?, ?)
+                    """,
+                    (
+                        f"country_alias:{alias_norm}",
+                        json.dumps(
+                            {"alias": alias_raw, "alpha3": alpha3}, ensure_ascii=False
+                        ),
+                        actor,
+                        reason,
+                        now,
+                    ),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO task_versions (task_id, version, status, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (task_id, new_version, row["status"], now),
+            )
+            conn.execute(
+                """
+                UPDATE tasks SET version = ?, updated_at = ?,
+                                 reprocess_confirmed = 0, content_hash = NULL,
+                                 business_identity = NULL, last_error = NULL,
+                                 retry_count = 0, failure_notified = 0
+                 WHERE id = ?
+                """,
+                (new_version, now, task_id),
+            )
+            source_rows = conn.execute(
+                "SELECT * FROM task_inputs WHERE task_id = ? AND version = ?",
+                (task_id, old_version),
+            ).fetchall()
+            for source in source_rows:
+                if normalize_key(str(source["filename"])) in excluded:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_inputs (
+                        id, task_id, version, mail_id, file_hash, path, filename,
+                        source_type, mime_type, size_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("input"),
+                        task_id,
+                        new_version,
+                        source["mail_id"],
+                        source["file_hash"],
+                        source["path"],
+                        source["filename"],
+                        source["source_type"],
+                        source["mime_type"],
+                        source["size_bytes"],
+                        now,
+                    ),
+                )
+            if destination is not None:
+                conn.execute(
+                    """
+                    UPDATE tasks SET destination_name = ?, destination_alpha3 = ?,
+                                     updated_at = ? WHERE id = ?
+                    """,
+                    (destination[0], destination[1], now, task_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE task_versions SET destination_name = ?, destination_alpha3 = ?
+                     WHERE task_id = ? AND version = ?
+                    """,
+                    (destination[0], destination[1], task_id, new_version),
+                )
+            for item in overrides:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_overrides (
+                        task_id, record_key, field, value, source_message_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id,
+                        item["record_key"],
+                        item["field"],
+                        item["value"],
+                        item.get("source_message_id"),
+                        now,
+                    ),
+                )
+            for item in inputs:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_inputs (
+                        id, task_id, version, mail_id, file_hash, path, filename,
+                        source_type, mime_type, size_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id("input"),
+                        task_id,
+                        new_version,
+                        item.get("mail_id"),
+                        item["file_hash"],
+                        item["path"],
+                        item["filename"],
+                        item.get("source_type", "attachment"),
+                        item.get("mime_type"),
+                        int(item.get("size_bytes") or 0),
+                        now,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE task_issues SET status = 'superseded', resolved_at = ?
+                 WHERE task_id = ? AND version < ? AND status = 'open'
+                """,
+                (now, task_id, new_version),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_events (
+                    task_id, version, stage, from_status, to_status, code,
+                    detail_json, actor, created_at
+                ) VALUES (?, ?, 'versioning', ?, ?, 'new_version_started', ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    new_version,
+                    row["status"],
+                    row["status"],
+                    json.dumps(
+                        {"from_version": old_version, "reason": reason},
+                        ensure_ascii=False,
+                    ),
+                    actor,
+                    now,
+                ),
+            )
+        self.logger.info(
+            "task_new_version",
+            task_id=task_id,
+            version=new_version,
+            from_version=old_version,
+            actor=actor,
+        )
+        return self.require(task_id)
 
     def add_input(
         self,

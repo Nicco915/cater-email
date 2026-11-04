@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from .supplement import (
 from .tasks import TaskRepository
 from .util import (
     normalize_email,
+    normalize_filename,
     normalize_key,
     safe_filename,
     sha256_bytes,
@@ -39,6 +41,11 @@ AUTO_PROCESS_SUPPLEMENT_STATUSES = {
     state.WAITING_INPUT,
     state.RETRY_PENDING,
     state.FAILED,
+}
+
+XLSX_CONTENT_TYPES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/xlsx",
 }
 
 
@@ -55,7 +62,36 @@ class IngestResult:
     supplement: bool = False
     needs_question: bool = False
     waiting: bool = False
+    status_query: bool = False
+    retry_command: bool = False
+    retry_waiting: bool = False
+    notice: str | None = None
+    notice_suffix: str | None = None
+    guidance: str | None = None
     note: str | None = None
+
+
+# Generic, task-free guidance for command mails that cannot be linked to a
+# task. It intentionally contains no task information.
+GUIDANCE_UNKNOWN_TASK = (
+    "您好：\n\n"
+    "这封邮件包含操作指令，但我们无法确定它对应哪一票任务，因此没有执行任何操作，也没有创建新任务。\n"
+    "如需查询进度或重试，请直接回复系统发送给您的最新通知邮件；\n"
+    "或者新写一封邮件，第一行填写：任务编号：task_xxx（把 task_xxx 换成通知邮件主题或正文中的任务编号），"
+    "第二行单独写：查询状态 或 重试。\n"
+    "如仍无法解决，请联系维护人员。"
+)
+
+GUIDANCE_NOT_OWNER = (
+    "您好：\n\n"
+    "这封邮件关联的任务只能由原发件人本人通过邮件操作，我们未执行任何操作，也无法提供该任务的信息。\n"
+    "如需查询进度，请由原发件人回复最新通知邮件，或新写邮件注明任务编号并单独写：查询状态。\n"
+    "如有疑问，请联系维护人员。"
+)
+
+
+def _mail_fingerprint(mail: dict[str, Any]) -> str:
+    return str(mail.get("raw_hash") or mail.get("message_id") or mail["id"])
 
 
 class IntakeService:
@@ -165,18 +201,43 @@ class IntakeService:
             in_reply_to=parsed.in_reply_to,
             references=parsed.references,
         )
-        if association.ambiguous:
-            return self._filter(
-                mail,
-                "ambiguous_task_reference",
-                note=association.reason,
-            )
-        if association.task_id is None and association.unknown_task_ids:
-            return self._filter(
-                mail,
-                "unknown_task_id",
-                note=", ".join(association.unknown_task_ids),
-            )
+        if supplement.has_command:
+            # A command that cannot be pinned to exactly one task must still
+            # get the sender usable guidance (no task information is leaked),
+            # and it must never spawn a business task.
+            if association.ambiguous:
+                result = self._filter(
+                    mail,
+                    "ambiguous_task_reference",
+                    note=association.reason,
+                )
+                result.guidance = GUIDANCE_UNKNOWN_TASK
+                return result
+            if association.task_id is None and association.unknown_task_ids:
+                result = self._filter(
+                    mail,
+                    "unknown_task_id",
+                    note=", ".join(association.unknown_task_ids),
+                )
+                result.guidance = GUIDANCE_UNKNOWN_TASK
+                return result
+            if association.task_id is None:
+                result = self._filter(mail, "command_without_task_reference")
+                result.guidance = GUIDANCE_UNKNOWN_TASK
+                return result
+        else:
+            if association.ambiguous:
+                return self._filter(
+                    mail,
+                    "ambiguous_task_reference",
+                    note=association.reason,
+                )
+            if association.task_id is None and association.unknown_task_ids:
+                return self._filter(
+                    mail,
+                    "unknown_task_id",
+                    note=", ".join(association.unknown_task_ids),
+                )
 
         if association.task_id:
             return self._handle_supplement(mail, parsed, supplement, association)
@@ -291,11 +352,13 @@ class IntakeService:
     ) -> IngestResult:
         task = self.tasks.require(str(association.task_id))
         if normalize_email(parsed.sender) != normalize_email(str(task["owner"])):
-            return self._filter(
+            result = self._filter(
                 mail,
                 "supplement_from_non_owner",
                 task_id=str(task["id"]),
             )
+            result.guidance = GUIDANCE_NOT_OWNER
+            return result
         self.mail_store.set_task(str(mail["id"]), str(task["id"]))
         version = int(task["version"])
         self.logger.info(
@@ -329,39 +392,42 @@ class IntakeService:
                 note="invalid_supplement",
             )
 
-        if supplement.reprocess:
-            prior_confirmation = self.db.fetchone(
-                "SELECT id FROM mail_messages WHERE id<>? AND task_id=? AND "
-                "(raw_hash=? OR (message_id IS NOT NULL AND message_id<>'' AND message_id=?)) LIMIT 1",
-                (str(mail["id"]), str(task["id"]), mail["raw_hash"], mail.get("message_id")))
-            if prior_confirmation:
-                return self._filter(mail, "duplicate_reprocess_confirmation", task_id=str(task["id"]))
-            # A confirmation is a separate operation: never silently ignore edits
-            # or attachments bundled with it. Keep ownership/allowlist checks above.
-            if (supplement.destination or supplement.mappings or supplement.overrides
-                    or supplement.bare_fields or parsed.attachments):
-                return self._filter(mail, "reprocess_mixed_directives", task_id=str(task["id"]),
-                                    note="Reply only with 确认重新处理; send corrections separately.")
-            if task["status"] not in {state.COMPLETED, state.WAITING_INPUT,
-                                       state.FAILED, state.RETRY_PENDING, state.READY_TO_SEND}:
-                return self._filter(mail, "reprocess_status_blocked", task_id=str(task["id"]))
-            pending = self.db.fetchone(
-                "SELECT id FROM outbox WHERE task_id=? AND status IN ('pending','sending','send_unknown') LIMIT 1",
-                (str(task["id"]),))
-            if pending:
-                return self._filter(mail, "reprocess_delivery_unsettled", task_id=str(task["id"]))
-            # A late reply to an older version must not repeat a newer delivery.
-            import re
-            versions = re.findall(r"\[CATER\s+" + re.escape(str(task["id"])) + r"\s+v(\d+)\]",
-                                  parsed.subject or "", flags=re.I)
-            if versions and any(int(value) != version for value in versions):
-                return self._filter(mail, "reprocess_stale_version", task_id=str(task["id"]))
-            self.tasks.add_event(str(task["id"]), stage="intake", code="mail_reprocess_confirmed",
-                                 actor=str(task["owner"]), detail={"mail_id": mail["id"], "version": version})
-            return IngestResult(mail_id=str(mail["id"]), task_id=str(task["id"]),
-                                supplement=True, reprocess_requested=True)
+        # ----- owner commands: 查询状态 / 重试 / 确认重新处理 ---------------
+        # A mail may carry at most one command, and a command mail must not
+        # bundle attachments or data directives; nothing may be half-applied.
+        command_count = len(supplement.commands)
+        non_inline_attachments = [item for item in parsed.attachments if not item.is_inline]
+        if command_count > 1:
+            return self._reject_command(
+                mail,
+                task,
+                version,
+                "command_mixed",
+                "一封邮件只能包含一个指令，本次未执行任何操作。"
+                "查询进度请单独写：查询状态；技术故障重试请单独写：重试；"
+                "重新处理请单独写：确认重新处理。",
+            )
+        if command_count == 1 and (
+            supplement.destination
+            or supplement.mappings
+            or supplement.overrides
+            or supplement.bare_fields
+            or non_inline_attachments
+        ):
+            return self._reject_command(
+                mail,
+                task,
+                version,
+                "command_with_payload",
+                "指令邮件不能夹带附件或字段修改，本次未执行任何操作，您的资料未作改动。"
+                "请先按提示格式发送需要补充的附件或字段，再单独发送指令。",
+            )
+        if command_count == 1:
+            return self._handle_command(mail, parsed, supplement, task, version)
 
-        if not supplement.has_actions:
+        # ----- data supplements and/or attachment replacement -------------
+        business_attachments = self._business_attachments(parsed)
+        if not supplement.has_actions and not business_attachments:
             issue = {
                 "code": "UNSTRUCTURED_SUPPLEMENT",
                 "record_key": None,
@@ -424,9 +490,37 @@ class IntakeService:
                 note="supplement_attachment_issue",
             )
 
+        # Plan attachment replacement before any write: same-name attachments
+        # replace the matching input for the new version only (old files and
+        # old version rows stay untouched); different or conflicting names
+        # pause the task with an explanation instead of guessing.
+        staged: list[dict[str, Any]] = []
+        replaced_names: set[str] = set()
+        if business_attachments:
+            plan_issue, staged, replaced_names = self._stage_replacements(
+                str(task["id"]), version, str(mail["id"]), business_attachments
+            )
+            if plan_issue is not None:
+                plan_issue["sources"] = [{"kind": "mail", "mail_id": mail["id"]}]
+                self.tasks.add_issue(str(task["id"]), version, plan_issue)
+                self.logger.warning(
+                    "attachment_replacement_blocked",
+                    task_id=task["id"],
+                    mail_id=mail["id"],
+                    code=plan_issue["code"],
+                )
+                return IngestResult(
+                    mail_id=str(mail["id"]),
+                    task_id=str(task["id"]),
+                    supplement=True,
+                    needs_question=True,
+                    note="attachment_replacement_blocked",
+                )
+
         applied_errors: list[dict[str, Any]] = []
         # Validate every directive before writing anything. A malformed later
         # line must not leave a half-applied alias or destination change.
+        validated_aliases: list[tuple[str, str, str]] = []
         seen_alias_codes: dict[str, str] = {}
         for mapping in supplement.mappings:
             try:
@@ -458,7 +552,9 @@ class IntakeService:
                         "required_action": "Send one unambiguous mapping per alias.",
                     }
                 )
+                continue
             seen_alias_codes[alias_norm] = alpha3
+            validated_aliases.append((alias_norm, mapping.alias.strip(), alpha3))
 
         destination = None
         if supplement.destination:
@@ -511,6 +607,7 @@ class IntakeService:
                 ]
 
         if applied_errors:
+            self._discard_staged(str(task["id"]), str(mail["id"]), staged)
             for issue in applied_errors:
                 self.tasks.add_issue(str(task["id"]), version, issue)
             return IngestResult(
@@ -521,70 +618,35 @@ class IntakeService:
                 note="supplement_validation_failed",
             )
 
-        # All directives are valid; now write the alias configuration. Each
-        # call is individually audited in config_versions.
-        for mapping in supplement.mappings:
-            try:
-                self.references.add_alias(
-                    mapping.alias,
-                    mapping.alpha3,
-                    actor=str(task["owner"]),
-                    reason=f"supplement {mail['id']}",
-                )
-            except ValidationError as exc:  # defensive: pre-validation passed
-                issue = {
-                    "code": "COUNTRY_MAPPING_CONFLICT",
-                    "record_key": None,
-                    "field": "destination",
-                    "message": str(exc),
-                    "sources": [{"kind": "mail", "mail_id": mail["id"]}],
-                    "required_action": "Confirm a non-conflicting country mapping explicitly.",
-                }
-                self.tasks.add_issue(str(task["id"]), version, issue)
-                return IngestResult(
-                    mail_id=str(mail["id"]),
-                    task_id=str(task["id"]),
-                    supplement=True,
-                    needs_question=True,
-                    note="supplement_validation_failed",
-                )
-
-        task = self.tasks.start_next_version(
-            str(task["id"]),
-            actor=str(task["owner"]),
-            reason=f"supplement {mail['id']}",
-            copy_inputs=True,
-        )
-        version = int(task["version"])
-        if destination:
-            self.tasks.update_destination(
-                str(task["id"]), destination["name_zh"], destination["alpha3"]
+        # All directives are valid. Phase 1: move the staged files into the
+        # future version's inputs directory. Phase 2: commit every database
+        # change (aliases with audit, the new version, destination, overrides
+        # and input rows) in ONE transaction. A failure in either phase
+        # removes the unreferenced files and leaves the old active version,
+        # its inputs and the reference configuration untouched.
+        task_id = str(task["id"])
+        future_version = version + 1
+        directory = self.config.tasks_dir / task_id / f"v{future_version}" / "inputs"
+        moved: list[Path] = []
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            for item in staged:
+                target = directory / safe_filename(str(item["stored_name"]))
+                os.replace(item["path"], target)
+                try:
+                    os.chmod(target, 0o600)
+                except OSError:
+                    pass
+                moved.append(target)
+        except OSError:
+            self._cleanup_moved(task_id, str(mail["id"]), moved)
+            self.logger.exception(
+                "attachment_store_failed_task",
+                OSError("attachment commit failed"),
+                task_id=task_id,
             )
-        for item in supplement.overrides:
-            self.tasks.add_override(
-                str(task["id"]),
-                record_key=item.record_key,
-                field=item.field,
-                value=item.value,
-                source_message_id=parsed.message_id,
-            )
-        for item in bare_overrides:
-            self.tasks.add_override(
-                str(task["id"]),
-                record_key=item["record_key"],
-                field=item["field"],
-                value=item["value"],
-                source_message_id=parsed.message_id,
-            )
-        saved_ok = self._save_attachments(
-            task_id=str(task["id"]),
-            version=version,
-            mail_id=str(mail["id"]),
-            attachments=parsed.attachments,
-        )
-        if not saved_ok:
             self.tasks.add_issue(
-                str(task["id"]),
+                task_id,
                 version,
                 {
                     "code": "ATTACHMENT_WRITE_FAILED",
@@ -597,26 +659,438 @@ class IntakeService:
             )
             return IngestResult(
                 mail_id=str(mail["id"]),
-                task_id=str(task["id"]),
+                task_id=task_id,
                 supplement=True,
                 needs_question=True,
                 note="supplement_attachment_write_failed",
             )
+
+        input_rows = [
+            {
+                "mail_id": str(mail["id"]),
+                "file_hash": str(item["sha256"]),
+                "path": str(directory / safe_filename(str(item["stored_name"]))),
+                "filename": str(item["filename"]),
+                "mime_type": str(item["mime_type"]),
+                "size_bytes": int(item["size"]),
+            }
+            for item in staged
+        ]
+        override_rows = [
+            {
+                "record_key": item.record_key,
+                "field": item.field,
+                "value": item.value,
+                "source_message_id": parsed.message_id,
+            }
+            for item in supplement.overrides
+        ] + [
+            {
+                "record_key": item["record_key"],
+                "field": item["field"],
+                "value": item["value"],
+                "source_message_id": parsed.message_id,
+            }
+            for item in bare_overrides
+        ]
+        try:
+            task = self.tasks.apply_supplement(
+                task_id,
+                actor=str(task["owner"]),
+                reason=f"supplement {mail['id']}",
+                exclude_filenames=replaced_names,
+                aliases=validated_aliases,
+                destination=(
+                    (destination["name_zh"], destination["alpha3"]) if destination else None
+                ),
+                overrides=override_rows,
+                inputs=input_rows,
+            )
+        except Exception:
+            self._cleanup_moved(task_id, str(mail["id"]), moved)
+            self.logger.exception(
+                "supplement_apply_failed",
+                Exception("supplement transaction failed"),
+                task_id=task_id,
+            )
+            self.tasks.add_issue(
+                task_id,
+                version,
+                {
+                    "code": "SUPPLEMENT_APPLY_FAILED",
+                    "record_key": None,
+                    "field": None,
+                    "message": "本次补充内容未能保存，任务未作任何改动。",
+                    "sources": [{"kind": "mail", "mail_id": mail["id"]}],
+                    "required_action": "请重新发送补充内容；多次失败请联系维护人员。",
+                },
+            )
+            return IngestResult(
+                mail_id=str(mail["id"]),
+                task_id=task_id,
+                supplement=True,
+                needs_question=True,
+                note="supplement_apply_failed",
+            )
+        shutil.rmtree(
+            self.config.tasks_dir / task_id / "incoming" / str(mail["id"]),
+            ignore_errors=True,
+        )
+        version = int(task["version"])
         self.logger.info(
             "supplement_applied",
             task_id=task["id"],
             mail_id=mail["id"],
             version=version,
-            mappings=len(supplement.mappings),
-            overrides=len(supplement.overrides) + len(bare_overrides),
+            mappings=len(validated_aliases),
+            overrides=len(override_rows),
+            replaced_inputs=sorted(replaced_names),
             destination=destination["alpha3"] if destination else None,
         )
         return IngestResult(
             mail_id=str(mail["id"]),
-            task_id=str(task["id"]),
+            task_id=task_id,
             supplement=True,
             should_process=True,
         )
+
+    def _cleanup_moved(
+        self, task_id: str, mail_id: str, moved: list[Path]
+    ) -> None:
+        """Remove unreferenced files after a failed commit and drop staging.
+
+        The aborted future version directory only contains files this commit
+        attempt moved there, so it is removed whole once they are unlinked.
+        """
+
+        for path in moved:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if moved:
+            version_dir = moved[0].parent.parent
+            shutil.rmtree(version_dir, ignore_errors=True)
+        shutil.rmtree(self.config.tasks_dir / task_id / "incoming" / mail_id, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # owner mail commands
+    # ------------------------------------------------------------------
+    def _handle_command(
+        self,
+        mail: dict[str, Any],
+        parsed: ParsedMail,
+        supplement: SupplementParse,
+        task: dict[str, Any],
+        version: int,
+    ) -> IngestResult:
+        task_id = str(task["id"])
+        # Replay protection: the same mail (same raw content or Message-ID)
+        # must never execute a command twice, however the server redelivers it.
+        if self._command_replay(task_id, mail):
+            reason = {
+                "status": "duplicate_status_query",
+                "retry": "duplicate_retry_command",
+                "reprocess": "duplicate_reprocess_confirmation",
+            }[supplement.commands[0]]
+            return self._filter(mail, reason, task_id=task_id)
+        command = supplement.commands[0]
+        if command == "status":
+            self.tasks.add_event(
+                task_id,
+                stage="intake",
+                code="mail_status_query",
+                actor=str(task["owner"]),
+                detail={"mail_id": mail["id"], "version": version},
+            )
+            return IngestResult(
+                mail_id=str(mail["id"]), task_id=task_id, supplement=True, status_query=True
+            )
+        if command == "reprocess":
+            return self._handle_reprocess_command(mail, parsed, task, version)
+        return self._handle_retry_command(mail, task, version)
+
+    def _handle_reprocess_command(
+        self,
+        mail: dict[str, Any],
+        parsed: ParsedMail,
+        task: dict[str, Any],
+        version: int,
+    ) -> IngestResult:
+        task_id = str(task["id"])
+        if task["status"] not in {
+            state.COMPLETED,
+            state.WAITING_INPUT,
+            state.FAILED,
+            state.RETRY_PENDING,
+            state.READY_TO_SEND,
+        }:
+            return self._reject_command(
+                mail, task, version, "reprocess_status_blocked",
+                "该任务当前不能确认重新处理；请等待当前处理完成，或联系维护人员。",
+            )
+        pending = self.db.fetchone(
+            "SELECT id FROM outbox WHERE task_id=? AND status IN ('pending','sending','send_unknown') LIMIT 1",
+            (task_id,),
+        )
+        if pending:
+            return self._reject_command(
+                mail, task, version, "reprocess_delivery_unsettled",
+                "该任务有结果邮件尚未确认发送结果，暂时不能重新处理；请先联系维护人员核对，避免重复发送。",
+            )
+        # A late reply to an older version must not repeat a newer delivery.
+        import re
+
+        versions = re.findall(
+            r"\[CATER\s+" + re.escape(task_id) + r"\s+v(\d+)\]",
+            parsed.subject or "",
+            flags=re.I,
+        )
+        if versions and any(int(value) != version for value in versions):
+            return self._reject_command(
+                mail, task, version, "reprocess_stale_version",
+                "这封邮件对应的是旧版本任务。请回复最新的通知邮件（主题含最新版本号），"
+                "新增正文单独写：确认重新处理。",
+            )
+        self.tasks.add_event(
+            task_id,
+            stage="intake",
+            code="mail_reprocess_confirmed",
+            actor=str(task["owner"]),
+            detail={"mail_id": mail["id"], "version": version},
+        )
+        return IngestResult(
+            mail_id=str(mail["id"]), task_id=task_id, supplement=True, reprocess_requested=True
+        )
+
+    def _handle_retry_command(
+        self, mail: dict[str, Any], task: dict[str, Any], version: int
+    ) -> IngestResult:
+        task_id = str(task["id"])
+        status = str(task["status"])
+        if status in {state.RETRY_PENDING, state.FAILED}:
+            self.tasks.add_event(
+                task_id,
+                stage="intake",
+                code="mail_retry_requested",
+                actor=str(task["owner"]),
+                detail={"mail_id": mail["id"], "version": version},
+            )
+            return IngestResult(
+                mail_id=str(mail["id"]), task_id=task_id, supplement=True, retry_command=True
+            )
+        if status == state.WAITING_INPUT:
+            # Answered per command mail: older question rows are deduped by
+            # issue digest and may never resend, but a fresh active command
+            # must still receive the concrete missing-items guidance.
+            return IngestResult(
+                mail_id=str(mail["id"]),
+                task_id=task_id,
+                supplement=True,
+                retry_waiting=True,
+                note="retry_waiting_input",
+            )
+        if status in {state.RECEIVED, state.VALIDATING, state.PROCESSING}:
+            return self._reject_command(
+                mail, task, version, "retry_in_progress",
+                "任务正在处理中，无需重试；完成后会按当前设置发送结果通知。",
+            )
+        if status == state.READY_TO_SEND:
+            return self._reject_command(
+                mail, task, version, "retry_already_ready",
+                "结果文件已生成，正在等待发送，无需重试。"
+                "如需基于最新资料重新生成，请回复：确认重新处理",
+            )
+        if status == state.COMPLETED:
+            return self._reject_command(
+                mail, task, version, "retry_completed",
+                "该任务已完成，不会通过“重试”重复发送。"
+                "如需基于最新资料重新处理，请回复：确认重新处理",
+            )
+        if status == state.SEND_UNKNOWN:
+            return self._reject_command(
+                mail, task, version, "retry_send_unknown",
+                "该任务的结果邮件发送情况待人工确认，暂时不能重试，以免重复发送；请联系维护人员核对。",
+            )
+        return self._reject_command(
+            mail, task, version, "retry_cancelled",
+            "该任务已取消，不能通过邮件重试；请联系维护人员。",
+        )
+
+    def _reject_command(
+        self,
+        mail: dict[str, Any],
+        task: dict[str, Any],
+        version: int,
+        reason: str,
+        guidance: str,
+    ) -> IngestResult:
+        """Filter a rejected owner command without leaving the owner silent."""
+
+        result = self._filter(mail, reason, task_id=str(task["id"]))
+        result.notice = guidance
+        result.notice_suffix = f"command_rejected:{reason}:v{version}"
+        return result
+
+    def _command_replay(self, task_id: str, mail: dict[str, Any]) -> bool:
+        prior = self.db.fetchone(
+            "SELECT id FROM mail_messages WHERE id<>? AND task_id=? AND "
+            "(raw_hash=? OR (message_id IS NOT NULL AND message_id<>'' AND message_id=?)) LIMIT 1",
+            (str(mail["id"]), task_id, mail["raw_hash"], mail.get("message_id")),
+        )
+        return prior is not None
+
+    # ------------------------------------------------------------------
+    # attachment replacement (supplements)
+    # ------------------------------------------------------------------
+    def _business_attachments(self, parsed: ParsedMail) -> list[ParsedAttachment]:
+        valid: list[ParsedAttachment] = []
+        for item in parsed.attachments:
+            if item.is_inline:
+                continue
+            if item.suffix != "xlsx" and item.content_type not in XLSX_CONTENT_TYPES:
+                continue
+            if item.size > self.config.mail.max_attachment_bytes:
+                continue
+            valid.append(item)
+        return valid
+
+    def _stage_replacements(
+        self,
+        task_id: str,
+        version: int,
+        mail_id: str,
+        attachments: list[ParsedAttachment],
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], set[str]]:
+        """Validate same-name replacement and stage files before any DB write.
+
+        Returns ``(issue, staged, replaced_names)``. When ``issue`` is not
+        None the caller must change nothing; ``staged`` is then empty and no
+        file or version has been touched.
+        """
+
+        inputs = [
+            item
+            for item in self.tasks.inputs(task_id, version)
+            if item.get("source_type") != "offline_original"
+        ]
+        groups: dict[str, list[ParsedAttachment]] = {}
+        for item in attachments:
+            groups.setdefault(normalize_filename(item.filename), []).append(item)
+        for group in groups.values():
+            if len({item.sha256 for item in group}) > 1:
+                return (
+                    {
+                        "code": "ATTACHMENT_NAME_CONFLICT",
+                        "record_key": None,
+                        "field": "attachment",
+                        "message": group[0].filename,
+                        "sources": [],
+                        "required_action": (
+                            "同一邮件中同名附件内容不一致；请只保留一份正确文件后重新发送。"
+                        ),
+                    },
+                    [],
+                    set(),
+                )
+        replaced: set[str] = set()
+        unmatched: list[str] = []
+        for name, group in groups.items():
+            if any(normalize_filename(str(item["filename"])) == name for item in inputs):
+                replaced.add(name)
+            else:
+                unmatched.append(group[0].filename)
+        if unmatched:
+            if not inputs and len(groups) == 1:
+                # The task has no business workbook yet (for example the
+                # original mail had none or only an unsupported file): a
+                # single recognizable attachment is accepted as the first
+                # supply. Several different-name attachments stay ambiguous.
+                pass
+            elif not inputs:
+                return (
+                    {
+                        "code": "ATTACHMENT_ROLE_UNKNOWN",
+                        "record_key": None,
+                        "field": "attachment",
+                        "message": "、".join(unmatched),
+                        "sources": [],
+                        "required_action": (
+                            "本任务尚未保存任何 Excel 附件，无法判别多份附件各自的角色，"
+                            "本次未采用任何一份。请只发送本任务需要的一份 Excel；"
+                            "如确需多份，请分多次发送并在每次沿用对应的原附件名，"
+                            "或联系维护人员确认。"
+                        ),
+                    },
+                    [],
+                    set(),
+                )
+            else:
+                current = "、".join(
+                    dict.fromkeys(str(item["filename"]) for item in inputs)
+                ) or "（当前版本没有已保存的 Excel 附件）"
+                return (
+                    {
+                        "code": "ATTACHMENT_NAME_MISMATCH",
+                        "record_key": None,
+                        "field": "attachment",
+                        "message": "、".join(unmatched),
+                        "sources": [],
+                        "required_action": (
+                            "请沿用原附件名重新发送该 Excel 文件；"
+                            f"当前参与本任务处理的附件名：{current}。"
+                        ),
+                    },
+                    [],
+                    set(),
+                )
+        staging = self.config.tasks_dir / task_id / "incoming" / mail_id
+        staged: list[dict[str, Any]] = []
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            for item in attachments:
+                stored = stored_filename(item.sha256, item.filename)
+                target = staging / safe_filename(stored)
+                temporary = target.with_name(target.name + ".tmp")
+                temporary.write_bytes(item.data)
+                os.replace(temporary, target)
+                staged.append(
+                    {
+                        "path": target,
+                        "stored_name": stored,
+                        "filename": item.filename,
+                        "sha256": item.sha256,
+                        "size": item.size,
+                        "mime_type": item.content_type,
+                    }
+                )
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
+            self.logger.exception(
+                "attachment_store_failed_task",
+                OSError("attachment staging failed"),
+                task_id=task_id,
+            )
+            return (
+                {
+                    "code": "ATTACHMENT_WRITE_FAILED",
+                    "record_key": None,
+                    "field": "attachment",
+                    "message": "、".join(group[0].filename for group in groups.values()),
+                    "sources": [],
+                    "required_action": "补件附件暂时无法安全保存，本次未作任何改动；请重新发送 xlsx 附件。",
+                },
+                [],
+                set(),
+            )
+        return None, staged, replaced
+
+    def _discard_staged(
+        self, task_id: str, mail_id: str, staged: list[dict[str, Any]]
+    ) -> None:
+        if not staged:
+            return
+        shutil.rmtree(self.config.tasks_dir / task_id / "incoming" / mail_id, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # attachments

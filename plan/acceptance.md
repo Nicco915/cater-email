@@ -33,3 +33,10 @@
 - docProps/app.xml中旧工作表名属文档元数据，不影响可见工作表、字体、批注和打印；已记录为非阻塞限制。
 - 仅支持完整源码+editable部署；非editable wheel独立部署不在本期范围。
 - 本轮尚无git commit，全部成果仍在工作区；提交时必须排除真实配置、凭证和runtime，客户样例是否入库另行明确。
+
+## 邮件自助闭环追加验收（2026-11-04）
+
+- Claude实现并经多轮审核返工：查询状态、技术重试、有限自动重试与故障通知、taskless通用指引、同名附件替换、首次附件补齐、原子提交与失败回滚。
+- 协调者独立完整测试：219 passed、3 skipped（无pwsh）。
+- 协调者另模拟v5到v7的非空库升级：原任务和SEND_UNKNOWN outbox、发送次数保留，foreign_key_check无错误。
+- 无真实外发；Windows和真实邮箱实测仍由用户执行。历史补扫仍暂缓，详见plan/follow-ups.md。

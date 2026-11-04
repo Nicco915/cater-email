@@ -299,7 +299,7 @@ class OutboundMessage:
     subject: str
     body: str
     message_id: str
-    task_id: str
+    task_id: str | None  # None for taskless guidance mail
     purpose: str
     attachments: tuple[OutboundAttachment, ...] = ()
     in_reply_to: str | None = None

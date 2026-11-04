@@ -299,7 +299,8 @@ def build_outbound_email(message: OutboundMessage, *, from_address: str) -> Emai
     )
     email_message["Date"] = format_datetime(datetime.now(timezone.utc))
     email_message["Auto-Submitted"] = "auto-generated"
-    email_message["X-CATER-Task"] = message.task_id
+    if message.task_id:
+        email_message["X-CATER-Task"] = message.task_id
     email_message["X-CATER-Purpose"] = message.purpose
     if message.in_reply_to:
         email_message["In-Reply-To"] = (

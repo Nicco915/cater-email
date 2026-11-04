@@ -9,6 +9,9 @@
     <dt>结构版本</dt><dd>{{ health.schema_version }}</dd>
     <dt>quick_check</dt><dd class="mono">{{ health.quick_check }}</dd>
     <dt>发件结果不确定</dt><dd>{{ health.outbox_unknown }}</dd>
+    <dt>技术故障自动重试中</dt><dd>{{ health.retry_pending }}</dd>
+    <dt>技术故障已暂停</dt><dd>{{ health.failed }}</dd>
+    <dt>上次全局收信异常</dt><dd class="mono">{{ health.last_poll_error or "无（仅本机显示，不会自动群发通知）" }}</dd>
     <dt>账号已配置</dt><dd>{{ "是" if health.account_configured else "否" }}</dd>
   </dl>
 </section>

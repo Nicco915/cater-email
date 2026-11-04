@@ -59,6 +59,8 @@ class OverrideDirective:
 class SupplementParse:
     task_ids: list[str] = field(default_factory=list)
     reprocess: bool = False
+    status_query: bool = False
+    retry: bool = False
     destination: str | None = None
     mappings: list[CountryMapping] = field(default_factory=list)
     overrides: list[OverrideDirective] = field(default_factory=list)
@@ -75,6 +77,21 @@ class SupplementParse:
             or self.overrides
             or self.bare_fields
         )
+
+    @property
+    def commands(self) -> list[str]:
+        found: list[str] = []
+        if self.status_query:
+            found.append("status")
+        if self.retry:
+            found.append("retry")
+        if self.reprocess:
+            found.append("reprocess")
+        return found
+
+    @property
+    def has_command(self) -> bool:
+        return bool(self.commands)
 
     def has_task_signal(self) -> bool:
         return bool(self.task_ids)
@@ -127,6 +144,13 @@ def parse_supplement(parsed: ParsedMail) -> SupplementParse:
 
     result.reprocess = any(line.strip() in {"重新处理", "确认重新处理"} for line in body.splitlines())
     if result.reprocess:
+        result.directive_count += 1
+    # Read-only owner commands; each must be a standalone newly written line.
+    if any(line.strip() == "查询状态" for line in body.splitlines()):
+        result.status_query = True
+        result.directive_count += 1
+    if any(line.strip() == "重试" for line in body.splitlines()):
+        result.retry = True
         result.directive_count += 1
 
     destinations = [match.group(1).strip() for match in _DEST_RE.finditer(body)]
@@ -248,11 +272,11 @@ class SupplementRouter:
         rows = self.db.fetchall(
             f"""
             SELECT DISTINCT task_id FROM outbox
-             WHERE trim(message_id, '<>') IN ({placeholders})
+             WHERE task_id IS NOT NULL AND trim(message_id, '<>') IN ({placeholders})
             """,
             tuple(sorted(normalized)),
         )
-        return {str(row["task_id"]) for row in rows}
+        return {str(row["task_id"]) for row in rows if row["task_id"] is not None}
 
     def locate(
         self,

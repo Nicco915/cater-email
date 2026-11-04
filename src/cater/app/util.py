@@ -99,3 +99,10 @@ def normalize_key(value: str) -> str:
 
     text = unicodedata.normalize("NFKC", value or "").strip().casefold()
     return re.sub(r"\s+", " ", text)
+
+
+def normalize_filename(value: str) -> str:
+    """Normalize an attachment name for same-name replacement matching."""
+
+    text = unicodedata.normalize("NFC", value or "").strip().casefold()
+    return re.sub(r"\s+", "", text)

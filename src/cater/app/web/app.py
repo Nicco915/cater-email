@@ -334,7 +334,7 @@ def create_app(
         row = service.outbox.get(outbox_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Outbox message not found")
-        task_path = f"/tasks/{row['task_id']}"
+        task_path = f"/tasks/{row['task_id']}" if row["task_id"] else "/"
         if action == "recheck":
             try:
                 found = service.recheck_unknown(outbox_id, actor="web-admin")

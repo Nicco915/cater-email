@@ -36,6 +36,25 @@ from .tasks import TaskRepository
 from .util import EMAIL_RE, is_within, normalize_email, sha256_text, utc_now
 
 KIND_LABELS = {"parts": "配件", "machine": "整机", "auto": "自动识别"}
+STATUS_LABELS = {
+    state.RECEIVED: "已收到，等待检查",
+    state.VALIDATING: "资料检查中",
+    state.PROCESSING: "正在处理",
+    state.READY_TO_SEND: "结果文件已生成，等待发送",
+    state.COMPLETED: "已完成",
+    state.WAITING_INPUT: "等待您补充资料",
+    state.RETRY_PENDING: "遇到技术故障，正在按间隔自动重试",
+    state.FAILED: "技术故障，自动重试已用完，等待处理",
+    state.SEND_UNKNOWN: "发送结果待人工确认",
+    state.CANCELLED: "已取消",
+}
+FIELD_LABELS = {
+    "dealer_code": "经销商代码", "dealer_order": "客户订单号", "order": "SO订单号",
+    "material": "机型", "model": "机型", "serial_number": "机器序列号",
+    "total_sales_price": "机器销售价格", "net_weight": "净重", "qty": "数量",
+    "part_code": "商品料号", "coo": "原产国", "destination": "目的国",
+    "unit_price": "单价", "hs_code": "商品编码",
+}
 _QUIET_SUBJECT_RE = None
 
 
@@ -121,16 +140,13 @@ class DeliveryService:
     # ------------------------------------------------------------------
     # questions
     # ------------------------------------------------------------------
-    def question_body(self, task: dict[str, Any], issues: list[dict[str, Any]]) -> str:
-        lines = ["您好：", "", "这票资料还需要您确认以下内容，暂未发送结果文件。", ""]
+    def _describe_issues(
+        self, issues: list[dict[str, Any]]
+    ) -> tuple[list[str], list[str]]:
+        """Translate issue codes into short Chinese lines and reply examples."""
+
+        lines: list[str] = []
         examples: list[str] = []
-        labels = {
-            "dealer_code": "经销商代码", "dealer_order": "客户订单号", "order": "SO订单号",
-            "material": "机型", "model": "机型", "serial_number": "机器序列号",
-            "total_sales_price": "机器销售价格", "net_weight": "净重", "qty": "数量",
-            "part_code": "商品料号", "coo": "原产国", "destination": "目的国",
-            "unit_price": "单价", "hs_code": "商品编码",
-        }
         for issue in issues:
             code = str(issue.get("code") or "")
             record = issue.get("record_key")
@@ -147,7 +163,7 @@ class DeliveryService:
                 examples.append("确认重新处理")
             elif code == "MISSING_FIELD" or code.startswith("MISSING_"):
                 fields = [item.strip() for item in field.split(",") if item.strip()]
-                names = "、".join(labels.get(item, "业务信息") for item in fields) or "业务信息"
+                names = "、".join(FIELD_LABELS.get(item, "业务信息") for item in fields) or "业务信息"
                 lines.append(f"- {prefix}缺少{names}，请补充。")
                 if record and fields:
                     for name in fields:
@@ -157,7 +173,7 @@ class DeliveryService:
                     lines.append("  请联系处理人员核对该项资料，再按提示补充。")
             elif code == "FIELD_CONFLICT":
                 message = str(issue.get("message") or "")
-                lines.append(f"- {prefix}{labels.get(field, '资料')}在邮件与附件中不一致，请确认正确值。")
+                lines.append(f"- {prefix}{FIELD_LABELS.get(field, '资料')}在邮件与附件中不一致，请确认正确值。")
                 # Preserve useful business values without dumping internal source objects.
                 if "不一致：" in message:
                     lines.append("  两处填写分别为：" + message.split("不一致：", 1)[1])
@@ -165,12 +181,38 @@ class DeliveryService:
                     examples.append(f"修正：{record}.{field}=请填写正确值")
             elif "MODEL" in code or "MACHINE" in code or "SPECIAL_RULE" in code:
                 lines.append(f"- {prefix}机型或特殊申报资料尚未确认，请联系资料维护人员核对。")
+            elif code == "ATTACHMENT_NAME_MISMATCH":
+                lines.append(
+                    f"- 附件“{issue.get('message') or ''}”与已保存的资料文件名不一致。"
+                    "为保证不误用文件，本次未替换。"
+                )
+                if issue.get("required_action"):
+                    lines.append(f"  {issue['required_action']}")
+            elif code == "ATTACHMENT_NAME_CONFLICT":
+                lines.append(
+                    f"- 同一邮件中多份名为“{issue.get('message') or ''}”的附件内容不一致，"
+                    "本次未采用任何一份。"
+                )
+                lines.append("  请只保留一份正确文件后重新发送。")
+            elif code == "ATTACHMENT_ROLE_UNKNOWN":
+                lines.append(
+                    f"- 收到多份不同名附件（{'、'.join(str(item).strip() for item in str(issue.get('message') or '').split('、'))}），"
+                    "本任务还没有已保存的 Excel 附件，无法判别各自角色，本次未采用任何一份。"
+                )
+                if issue.get("required_action"):
+                    lines.append(f"  {issue['required_action']}")
             elif "ATTACHMENT" in code or "WORKBOOK" in code or "SHEET" in code or "UNSUPPORTED" in code:
                 lines.append("- 附件或工作表无法使用，请回复正确、完整且未加密的 Excel 文件。")
             elif "MAPPING" in code or "COUNTRY" in code:
                 lines.append(f"- {prefix}国家对应关系需要确认，请联系资料维护人员核对国家代码。")
             else:
                 lines.append(f"- {prefix}资料暂时无法通过检查，请联系处理人员核对本票资料。")
+        return lines, examples
+
+    def question_body(self, task: dict[str, Any], issues: list[dict[str, Any]]) -> str:
+        lines = ["您好：", "", "这票资料还需要您确认以下内容，暂未发送结果文件。", ""]
+        issue_lines, examples = self._describe_issues(issues)
+        lines.extend(issue_lines)
         examples = list(dict.fromkeys(examples))
         if examples:
             lines.extend(["", "请直接回复本邮件，按下面格式填写实际内容：", ""])
@@ -274,6 +316,323 @@ class DeliveryService:
                 stage="delivery",
                 code="notice_enqueued",
                 detail={"outbox_id": row["id"], "dry_run": dry_run},
+            )
+        return row, created
+
+    # ------------------------------------------------------------------
+    # status reports (read-only answers to owner "查询状态" mail commands)
+    # ------------------------------------------------------------------
+    def status_report_body(
+        self, task: dict[str, Any], open_issues: list[dict[str, Any]]
+    ) -> str:
+        status = str(task["status"])
+        label = STATUS_LABELS.get(status, status)
+        lines = [
+            "您好：",
+            "",
+            f"任务编号：{task['id']}（第 {int(task['version'])} 版）",
+            f"当前状态：{label}",
+            "",
+        ]
+        if open_issues:
+            lines.append("当前需要您处理的问题：")
+            issue_lines, examples = self._describe_issues(open_issues)
+            lines.extend(issue_lines)
+            examples = list(dict.fromkeys(examples))
+            if examples:
+                lines.extend(["", "请直接回复本邮件，按下面格式填写实际内容：", ""])
+                lines.extend(examples)
+            lines.extend(["", "补齐后我们会继续检查并处理，无需其他操作。"])
+        else:
+            if status in {state.RETRY_PENDING, state.FAILED}:
+                lines.append(
+                    "处理程序遇到技术故障，您已保存的资料不会丢失，无需重新发送邮件。"
+                )
+                lines.append("可直接回复本邮件，新增正文单独写：重试")
+                lines.append("如多次重试仍不成功，请联系维护人员处理。")
+            elif status == state.SEND_UNKNOWN:
+                lines.append("结果邮件的发送情况需要维护人员人工核对，在此之前不会重复发送。")
+                lines.append("如急需结果文件，请联系维护人员。")
+            elif status in {state.READY_TO_SEND, state.COMPLETED}:
+                lines.append("结果文件已生成并按当前发送设置处理，无需操作。")
+                if status == state.COMPLETED:
+                    lines.append("如需基于最新资料再次生成，请回复：确认重新处理")
+            else:
+                lines.append("任务正在按流程处理，无需操作；有新进展会再通知您。")
+        lines.extend(
+            [
+                "",
+                "说明：本邮件只是状态告知，不会改动您的资料或任务。",
+                f"查询编号：{task['id']}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def enqueue_status_report(
+        self,
+        task: dict[str, Any],
+        *,
+        query_mail_id: str,
+        open_issues: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist a read-only status answer, deduplicated per query mail.
+
+        The dedupe key combines a fingerprint of the querying mail with a
+        digest of the visible task state: redelivering the same query mail
+        while nothing changed reuses the existing answer instead of notifying
+        again, while a new query mail (or a changed state) produces a fresh
+        report.
+        """
+
+        query_mail = self.mail_store.get(query_mail_id)
+        fingerprint = str(
+            (query_mail or {}).get("raw_hash")
+            or (query_mail or {}).get("message_id")
+            or query_mail_id
+        )
+        state_digest = sha256_text(
+            json.dumps(
+                {
+                    "status": str(task["status"]),
+                    "version": int(task["version"]),
+                    "issues": [
+                        [issue.get("code"), issue.get("record_key"), issue.get("field")]
+                        for issue in open_issues
+                    ],
+                    "retry_count": int(task.get("retry_count") or 0),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )[:24]
+        dedupe_key = f"status:{task['id']}:{fingerprint[:32]}:{state_digest}"
+        recipient = self._recipient(task)
+        in_reply_to, references = self._thread_headers(task)
+        body = self.status_report_body(task, open_issues)
+        task_version = int(task["version"])
+        subject = outbound_subject(
+            self._original_subject(task), str(task["id"]), task_version
+        )
+        dry_run = not self._live_allowed(recipient)
+        row, created = self.outbox.enqueue(
+            dedupe_key=dedupe_key,
+            task_id=str(task["id"]),
+            version=task_version,
+            purpose="status",
+            recipient=recipient,
+            recipient_name=task.get("owner_name"),
+            subject=subject,
+            body=body,
+            attachments=[],
+            in_reply_to=in_reply_to,
+            references=references,
+            message_id=self._message_id(str(task["id"]), "status", dedupe_key),
+            dry_run=dry_run,
+        )
+        if created:
+            self.tasks.add_event(
+                str(task["id"]),
+                stage="delivery",
+                code="status_report_enqueued",
+                detail={"outbox_id": row["id"], "dry_run": dry_run, "mail_id": query_mail_id},
+            )
+            self.logger.info(
+                "status_report_enqueued",
+                task_id=task["id"],
+                outbox_id=row["id"],
+                dry_run=dry_run,
+                mail_id=query_mail_id,
+            )
+        return row, created
+
+    # ------------------------------------------------------------------
+    # failure notices (technical retry budget exhausted / non-recoverable)
+    # ------------------------------------------------------------------
+    def failure_notice_body(self, task: dict[str, Any], *, exhausted: bool) -> str:
+        if exhausted:
+            description = (
+                "处理程序已连续多次尝试（含数次自动重试）仍遇到技术故障，"
+                "自动重试已用完，本任务暂停处理。"
+            )
+            saved = "您通过邮件提供的资料已保存，无需重新发送原邮件。"
+        else:
+            description = (
+                "处理程序在第一次尝试时即无法继续处理该任务，未进行自动重试，"
+                "本任务暂停处理。"
+            )
+            saved = "请勿重复发送相同内容的邮件，避免产生重复任务。"
+        return "\n".join(
+            [
+                "您好：",
+                "",
+                f"任务编号：{task['id']}（第 {int(task['version'])} 版）",
+                description,
+                "",
+                saved,
+                "可直接回复本邮件，新增正文单独写：重试",
+                "如重试后仍不成功，请联系维护人员核对处理。",
+                "",
+                "说明：本邮件仅说明处理状态，不含技术细节。",
+                f"查询编号：{task['id']}",
+            ]
+        )
+
+    def enqueue_failure_notice(
+        self, task: dict[str, Any], *, episode: int, exhausted: bool
+    ) -> tuple[dict[str, Any], bool]:
+        recipient = self._recipient(task)
+        in_reply_to, references = self._thread_headers(task)
+        # ``episode`` (the persisted failure_seq) makes the notice unique per
+        # failure episode, so an explicit owner retry that fails again earns
+        # exactly one new feedback without repeating old ones.
+        dedupe_key = f"failure:{task['id']}:v{int(task['version'])}:{int(episode)}"
+        subject = outbound_subject(
+            self._original_subject(task), str(task["id"]), int(task["version"])
+        )
+        dry_run = not self._live_allowed(recipient)
+        row, created = self.outbox.enqueue(
+            dedupe_key=dedupe_key,
+            task_id=str(task["id"]),
+            version=int(task["version"]),
+            purpose="notice",
+            recipient=recipient,
+            recipient_name=task.get("owner_name"),
+            subject=subject,
+            body=self.failure_notice_body(task, exhausted=exhausted),
+            attachments=[],
+            in_reply_to=in_reply_to,
+            references=references,
+            message_id=self._message_id(str(task["id"]), "notice", dedupe_key),
+            dry_run=dry_run,
+        )
+        if created:
+            self.tasks.add_event(
+                str(task["id"]),
+                stage="delivery",
+                code="failure_notice_enqueued",
+                detail={"outbox_id": row["id"], "dry_run": dry_run, "exhausted": exhausted},
+            )
+        return row, created
+
+    # ------------------------------------------------------------------
+    # taskless guidance (mails that cannot be linked to any task)
+    # ------------------------------------------------------------------
+    def enqueue_guidance(
+        self,
+        *,
+        recipient: str,
+        recipient_name: str | None,
+        subject: str,
+        body: str,
+        in_reply_to: str | None,
+        references: list[str],
+        dedupe_key: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist generic guidance without a task, honouring send protections.
+
+        Goes through the same outbox/dry-run/allowlist pipeline as task mail;
+        it is never dispatched directly through the gateway.
+        """
+
+        dry_run = not self._live_allowed(recipient)
+        account = self.config.mail.account or "cater.local"
+        domain = account.rsplit("@", 1)[-1] if "@" in account else "cater.local"
+        token = sha256_text(dedupe_key)[:24]
+        row, created = self.outbox.enqueue(
+            dedupe_key=dedupe_key,
+            task_id=None,
+            version=0,
+            purpose="guidance",
+            recipient=recipient,
+            recipient_name=recipient_name,
+            subject=_clean_subject(subject) or "操作指引",
+            body=body,
+            attachments=[],
+            in_reply_to=in_reply_to,
+            references=references,
+            message_id=f"cater.guidance.{token}@{domain}",
+            dry_run=dry_run,
+        )
+        if created:
+            self.logger.info(
+                "guidance_enqueued",
+                outbox_id=row["id"],
+                recipient=recipient,
+                dry_run=dry_run,
+                dedupe_key=dedupe_key,
+            )
+        return row, created
+
+    # ------------------------------------------------------------------
+    # retry-on-waiting answers (one per command mail, not deduped against
+    # older questions about the same issues)
+    # ------------------------------------------------------------------
+    def retry_waiting_body(
+        self, task: dict[str, Any], open_issues: list[dict[str, Any]]
+    ) -> str:
+        lines = [
+            "您好：",
+            "",
+            f"任务编号：{task['id']}（第 {int(task['version'])} 版）",
+            "任务正在等待补充资料，暂时不能重试；请先补齐以下内容，",
+            "补齐后我们会继续检查并处理，无需再次发送“重试”。",
+            "",
+        ]
+        issue_lines, examples = self._describe_issues(open_issues)
+        lines.extend(issue_lines)
+        examples = list(dict.fromkeys(examples))
+        if examples:
+            lines.extend(["", "请直接回复本邮件，按下面格式填写实际内容：", ""])
+            lines.extend(examples)
+        lines.extend(["", f"查询编号：{task['id']}"])
+        return "\n".join(lines)
+
+    def enqueue_retry_waiting_answer(
+        self,
+        task: dict[str, Any],
+        *,
+        command_mail_id: str,
+        open_issues: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Answer a retry command for a waiting task, deduplicated per mail.
+
+        Older question rows are deduped by issue digest and may never be
+        resent; a new active command must still get its own concrete answer.
+        """
+
+        command_mail = self.mail_store.get(command_mail_id)
+        fingerprint = str(
+            (command_mail or {}).get("raw_hash")
+            or (command_mail or {}).get("message_id")
+            or command_mail_id
+        )
+        dedupe_key = f"retry-waiting:{task['id']}:{fingerprint[:40]}"
+        recipient = self._recipient(task)
+        in_reply_to, references = self._thread_headers(task)
+        dry_run = not self._live_allowed(recipient)
+        row, created = self.outbox.enqueue(
+            dedupe_key=dedupe_key,
+            task_id=str(task["id"]),
+            version=int(task["version"]),
+            purpose="notice",
+            recipient=recipient,
+            recipient_name=task.get("owner_name"),
+            subject=outbound_subject(
+                self._original_subject(task), str(task["id"]), int(task["version"])
+            ),
+            body=self.retry_waiting_body(task, open_issues),
+            attachments=[],
+            in_reply_to=in_reply_to,
+            references=references,
+            message_id=self._message_id(str(task["id"]), "notice", dedupe_key),
+            dry_run=dry_run,
+        )
+        if created:
+            self.tasks.add_event(
+                str(task["id"]),
+                stage="delivery",
+                code="retry_waiting_answer_enqueued",
+                detail={"outbox_id": row["id"], "mail_id": command_mail_id},
             )
         return row, created
 
@@ -408,13 +767,14 @@ class DeliveryService:
         if not self.config.mail.account:
             raise SendNotAllowedError("mail.account is not configured")
         claimed = self.outbox.mark_sending(outbox_id)
-        self.tasks.add_event(
-            str(claimed["task_id"]),
-            stage="delivery",
-            code="send_attempt",
-            actor=actor,
-            detail={"outbox_id": outbox_id, "attempt": claimed["attempts"]},
-        )
+        if claimed.get("task_id"):
+            self.tasks.add_event(
+                str(claimed["task_id"]),
+                stage="delivery",
+                code="send_attempt",
+                actor=actor,
+                detail={"outbox_id": outbox_id, "attempt": claimed["attempts"]},
+            )
         attachments = [
             OutboundAttachment(
                 path=str(item["path"]),
@@ -428,7 +788,7 @@ class DeliveryService:
             subject=str(claimed["subject"]),
             body=str(claimed["body"]),
             message_id=str(claimed["message_id"]),
-            task_id=str(claimed["task_id"]),
+            task_id=claimed["task_id"],
             purpose=str(claimed["purpose"]),
             attachments=tuple(attachments),
             in_reply_to=claimed.get("in_reply_to"),
@@ -455,13 +815,14 @@ class DeliveryService:
             return self.outbox.get(outbox_id) or unknown
         except (SendRejectedError, MailAuthError) as exc:
             failed = self.outbox.mark_failed(outbox_id, str(exc))
-            self.tasks.add_event(
-                str(failed["task_id"]),
-                stage="delivery",
-                code="send_permanent_failure",
-                actor=actor,
-                detail={"outbox_id": outbox_id, "error": str(exc)},
-            )
+            if failed["task_id"]:
+                self.tasks.add_event(
+                    str(failed["task_id"]),
+                    stage="delivery",
+                    code="send_permanent_failure",
+                    actor=actor,
+                    detail={"outbox_id": outbox_id, "error": str(exc)},
+                )
             self.logger.error(
                 "send_permanent_failure",
                 outbox_id=outbox_id,
@@ -488,13 +849,14 @@ class DeliveryService:
             pending = self.outbox.mark_pending(
                 outbox_id, error=str(exc), next_attempt_at=retry_at
             )
-            self.tasks.add_event(
-                str(pending["task_id"]),
-                stage="delivery",
-                code="send_retry_scheduled",
-                actor=actor,
-                detail={"outbox_id": outbox_id, "delay_seconds": delay, "error": str(exc)},
-            )
+            if pending["task_id"]:
+                self.tasks.add_event(
+                    str(pending["task_id"]),
+                    stage="delivery",
+                    code="send_retry_scheduled",
+                    actor=actor,
+                    detail={"outbox_id": outbox_id, "delay_seconds": delay, "error": str(exc)},
+                )
             self.logger.warning(
                 "send_retry_scheduled",
                 outbox_id=outbox_id,
@@ -511,8 +873,10 @@ class DeliveryService:
         return self.outbox.get(outbox_id) or sent
 
     def _on_sent(self, outbox_row: dict[str, Any], *, actor: str) -> None:
-        task_id = str(outbox_row["task_id"])
-        task = self.tasks.require(task_id)
+        task_id = outbox_row.get("task_id")
+        if not task_id:
+            return  # taskless guidance mail: no task event or transition
+        task = self.tasks.require(str(task_id))
         self.tasks.add_event(
             task_id,
             stage="delivery",
@@ -608,23 +972,32 @@ class DeliveryService:
         if row["status"] != SEND_UNKNOWN:
             raise ValueError("Only SEND_UNKNOWN messages can be confirmed as not sent")
         pending = self.outbox.mark_pending(outbox_id, error=None)
-        task = self.tasks.require(str(row["task_id"]))
-        if task["status"] == state.SEND_UNKNOWN and row["purpose"] == "delivery":
-            self.tasks.transition(
-                str(task["id"]),
-                state.READY_TO_SEND,
+        if row["task_id"]:
+            task = self.tasks.require(str(row["task_id"]))
+            if task["status"] == state.SEND_UNKNOWN and row["purpose"] == "delivery":
+                self.tasks.transition(
+                    str(task["id"]),
+                    state.READY_TO_SEND,
+                    stage="delivery",
+                    actor=actor,
+                    code="send_unknown_confirmed_not_sent",
+                    detail={"outbox_id": outbox_id},
+                )
+            self.tasks.add_event(
+                str(row["task_id"]),
                 stage="delivery",
+                code="unknown_confirmed_not_sent",
                 actor=actor,
-                code="send_unknown_confirmed_not_sent",
                 detail={"outbox_id": outbox_id},
             )
-        self.tasks.add_event(
-            str(row["task_id"]),
-            stage="delivery",
-            code="unknown_confirmed_not_sent",
-            actor=actor,
-            detail={"outbox_id": outbox_id},
-        )
+        else:
+            # Taskless guidance: queue it for a later explicit attempt; the
+            # confirmation path never blindsides a resend on its own.
+            self.logger.info(
+                "taskless_unknown_confirmed_not_sent",
+                outbox_id=outbox_id,
+                message_id=row["message_id"],
+            )
         return self.outbox.get(outbox_id) or pending
 
     def release_dry_run(self, outbox_id: str, *, actor: str) -> dict[str, Any]:
@@ -638,13 +1011,14 @@ class DeliveryService:
                 "is outside the active allowlist"
             )
         self.outbox.mark_pending(outbox_id)
-        self.tasks.add_event(
-            str(row["task_id"]),
-            stage="delivery",
-            code="dry_run_released",
-            actor=actor,
-            detail={"outbox_id": outbox_id},
-        )
+        if row["task_id"]:
+            self.tasks.add_event(
+                str(row["task_id"]),
+                stage="delivery",
+                code="dry_run_released",
+                actor=actor,
+                detail={"outbox_id": outbox_id},
+            )
         return self.dispatch(outbox_id, actor=actor)
 
     def retry_failed(self, outbox_id: str, *, actor: str) -> dict[str, Any]:
@@ -654,13 +1028,14 @@ class DeliveryService:
         if row["status"] != FAILED:
             raise ValueError("Only failed outbox messages can be retried explicitly")
         self.outbox.mark_pending(outbox_id)
-        self.tasks.add_event(
-            str(row["task_id"]),
-            stage="delivery",
-            code="outbox_retry_requested",
-            actor=actor,
-            detail={"outbox_id": outbox_id},
-        )
+        if row["task_id"]:
+            self.tasks.add_event(
+                str(row["task_id"]),
+                stage="delivery",
+                code="outbox_retry_requested",
+                actor=actor,
+                detail={"outbox_id": outbox_id},
+            )
         try:
             return self.dispatch(outbox_id, actor=actor)
         except SendNotAllowedError:

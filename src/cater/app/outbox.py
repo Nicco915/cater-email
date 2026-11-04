@@ -32,7 +32,7 @@ TRANSITIONS = {
     CANCELLED: set(),
 }
 
-PURPOSES = frozenset({"delivery", "question", "notice"})
+PURPOSES = frozenset({"delivery", "question", "notice", "status", "guidance"})
 
 
 class OutboxRepository:
@@ -47,7 +47,7 @@ class OutboxRepository:
         self,
         *,
         dedupe_key: str,
-        task_id: str,
+        task_id: str | None,
         version: int,
         purpose: str,
         recipient: str,

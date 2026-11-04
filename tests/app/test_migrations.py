@@ -45,7 +45,7 @@ def test_existing_database_is_upgraded_without_losing_reference_rows(
 
     database = Database(path)
     try:
-        assert database.schema_version() == 5
+        assert database.schema_version() == 7
         assert database.quick_check() == "ok"
         rows = [dict(row) for row in database.fetchall("SELECT * FROM machine_materials")]
         assert len(rows) == 1

@@ -359,10 +359,70 @@ ALTER TABLE machine_materials
 """
 
 
+MIGRATION_6 = """
+ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN failure_notified INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN failure_seq INTEGER NOT NULL DEFAULT 0;
+"""
+
+
+MIGRATION_7 = """
+PRAGMA defer_foreign_keys=ON;
+CREATE TABLE outbox_v7 (
+    id                  TEXT PRIMARY KEY,
+    dedupe_key          TEXT NOT NULL UNIQUE,
+    task_id             TEXT,
+    version             INTEGER NOT NULL DEFAULT 0,
+    purpose             TEXT NOT NULL,
+    recipient           TEXT NOT NULL,
+    recipient_name      TEXT,
+    subject             TEXT NOT NULL,
+    body                TEXT NOT NULL,
+    attachment_paths    TEXT NOT NULL DEFAULT '[]',
+    in_reply_to         TEXT,
+    references_header   TEXT,
+    payload_hash        TEXT NOT NULL,
+    message_id          TEXT NOT NULL UNIQUE,
+    status              TEXT NOT NULL,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    response            TEXT,
+    provider_message_id TEXT,
+    created_at          TEXT NOT NULL,
+    sending_at          TEXT,
+    sent_at             TEXT,
+    checked_at          TEXT,
+    next_attempt_at     TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+INSERT INTO outbox_v7 (
+    id, dedupe_key, task_id, version, purpose, recipient, recipient_name,
+    subject, body, attachment_paths, in_reply_to, references_header,
+    payload_hash, message_id, status, attempts, last_error, response,
+    provider_message_id, created_at, sending_at, sent_at, checked_at,
+    next_attempt_at
+)
+SELECT
+    id, dedupe_key, task_id, version, purpose, recipient, recipient_name,
+    subject, body, attachment_paths, in_reply_to, references_header,
+    payload_hash, message_id, status, attempts, last_error, response,
+    provider_message_id, created_at, sending_at, sent_at, checked_at,
+    next_attempt_at
+  FROM outbox;
+DROP TABLE outbox;
+ALTER TABLE outbox_v7 RENAME TO outbox;
+CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+CREATE INDEX IF NOT EXISTS idx_outbox_task ON outbox(task_id, version);
+CREATE INDEX IF NOT EXISTS idx_outbox_message_id_status ON outbox(message_id, status);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", MIGRATION_1),
     Migration(2, "additional_indexes", MIGRATION_2),
     Migration(3, "task_version_record_count", MIGRATION_3),
     Migration(4, "machine_reference_destination_scope", MIGRATION_4),
     Migration(5, "machine_special_rule_confirmed", MIGRATION_5),
+    Migration(6, "task_retry_budget", MIGRATION_6),
+    Migration(7, "outbox_taskless_guidance", MIGRATION_7),
 )
