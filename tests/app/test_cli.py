@@ -81,3 +81,40 @@ def test_cli_module_serve_stays_alive_and_serves_health(tmp_path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+
+
+def test_windows_server_selects_custom_loop_without_global_policy(monkeypatch):
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    import cater.app.cli as cli
+    import cater.app.web as web
+    import uvicorn
+    config = SimpleNamespace(web=SimpleNamespace(host='127.0.0.1', port=8766))
+    monkeypatch.setattr(cli, 'load_config', lambda *_: config)
+    monkeypatch.setattr(cli, '_service', lambda *_: nullcontext(object()))
+    monkeypatch.setattr(web, 'create_app', lambda *_, **__: object())
+    captured = {}
+    monkeypatch.setattr(uvicorn, 'run', lambda app, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(cli.sys, 'platform', 'win32')
+    args = SimpleNamespace(config=None, runtime=None, host=None, port=None, no_poll=True)
+    assert cli.cmd_serve(args) == 0
+    assert captured['loop'] == 'cater.app.event_loop:new_server_loop'
+    monkeypatch.setattr(cli.sys, 'platform', 'darwin')
+    cli.cmd_serve(args)
+    assert captured['loop'] == 'auto'
+
+
+def test_uvicorn_resolves_and_runs_selector_loop_factory():
+    import asyncio
+    import uvicorn
+    config = uvicorn.Config('cater.app.web:create_app', loop='cater.app.event_loop:new_server_loop')
+    factory = config.get_loop_factory()
+    loop = factory()
+    try:
+        assert isinstance(loop, asyncio.SelectorEventLoop)
+        async def probe():
+            return 42
+        assert loop.run_until_complete(probe()) == 42
+        assert loop.get_exception_handler() is None
+    finally:
+        loop.close()

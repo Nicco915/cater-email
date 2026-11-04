@@ -348,6 +348,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
             log_level="info",
             access_log=True,
             proxy_headers=False,
+            # Windows local HTTP clients may reset keep-alive connections.
+            # Avoid the Proactor shutdown callback without hiding exceptions.
+            loop="cater.app.event_loop:new_server_loop" if sys.platform == "win32" else "auto",
         )
     return 0
 
