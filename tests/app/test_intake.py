@@ -337,3 +337,63 @@ def test_free_form_supplement_is_not_interpreted(service) -> None:
     codes = {issue["code"] for issue in service.tasks.issues(task_id)}
     assert "UNSTRUCTURED_SUPPLEMENT" in codes
     assert service.tasks.require(task_id)["status"] == state.WAITING_INPUT
+
+def test_owner_can_confirm_duplicate_by_mail_and_replay_is_ignored(service):
+    original = service.ingest(raw_message(make_mail(), uid=100))
+    duplicate = service.ingest(raw_message(make_mail(), uid=101))
+    task = service.tasks.require(duplicate.task_id)
+    assert task['status'] == state.COMPLETED
+    notice = next(row for row in service.outbox.for_task(task['id']) if row['purpose'] == 'notice')
+    assert '确认重新处理' in notice['body']
+    reply = make_mail(subject=f"Re: [CATER {task['id']} v1]", text='确认重新处理',
+                      in_reply_to=notice['message_id'])
+    result = service.ingest(raw_message(reply, uid=102))
+    assert result.reprocess_requested
+    assert service.tasks.require(task['id'])['version'] == 2
+    assert service.tasks.require(task['id'])['status'] == state.READY_TO_SEND
+    assert len([row for row in service.outbox.for_task(task['id']) if row['purpose'] == 'delivery']) == 1
+    replay = service.ingest(raw_message(reply, uid=102))
+    assert replay.duplicate
+    assert service.tasks.require(task['id'])['version'] == 2
+    stale = service.ingest(raw_message(make_mail(subject=f"Re: [CATER {task['id']} v1]",
+                                                text='确认重新处理'), uid=103))
+    assert stale.filter_reason == 'reprocess_stale_version'
+
+
+def test_mail_reprocess_rejects_non_owner_and_quoted_confirmation(service):
+    created = service.ingest(raw_message(make_mail(), uid=110))
+    task_id = created.task_id
+    subject = f'Re: [CATER {task_id} v1]'
+    other = service.ingest(raw_message(make_mail(sender='other@example.com', subject=subject,
+                                                  text='确认重新处理'), uid=111))
+    assert other.filtered
+    quoted = service.ingest(raw_message(make_mail(subject=subject,
+        text='Thanks\n-----Original Message-----\n确认重新处理'), uid=112))
+    assert not quoted.reprocess_requested
+    assert service.tasks.require(task_id)['version'] == 1
+
+
+def test_mail_confirms_changed_business_identity(service, engine):
+    engine.business_identity = 'same-invoice'
+    service.ingest(raw_message(make_mail(), uid=120))
+    engine.content_hash = 'changed-content'
+    duplicate = service.ingest(raw_message(make_mail(), uid=121))
+    assert service.tasks.require(duplicate.task_id)['status'] == state.WAITING_INPUT
+    reply = make_mail(subject=f'Re: [CATER {duplicate.task_id} v1]', text='确认重新处理')
+    result = service.ingest(raw_message(reply, uid=122))
+    assert result.reprocess_requested
+    task = service.tasks.require(duplicate.task_id)
+    assert task['version'] == 2 and task['status'] == state.READY_TO_SEND
+
+
+def test_header_only_confirmation_is_idempotent_across_mailbox_coordinates(service):
+    original = service.ingest(raw_message(make_mail(), uid=130))
+    notice, _ = service.delivery.enqueue_notice(service.tasks.require(original.task_id),
+                                                body='Confirm reprocess', dedupe_suffix='probe')
+    reply = make_mail(subject='Re: Your task', text='确认重新处理',
+                      in_reply_to=notice['message_id'])
+    accepted = service.ingest(raw_message(reply, uid=131))
+    assert accepted.reprocess_requested
+    repeated = service.ingest(raw_message(reply, uid=132))
+    assert repeated.filter_reason == 'duplicate_reprocess_confirmation'
+    assert service.tasks.require(original.task_id)['version'] == 2

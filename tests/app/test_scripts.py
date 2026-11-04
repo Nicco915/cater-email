@@ -175,3 +175,16 @@ def test_interactive_launchers_keep_console_and_initialize_test_only():
     assert '"--enable"' not in initializer
     launcher = _read('run-web.ps1')
     assert 'api/health' in launcher and 'Start-Process $Url' in launcher
+
+
+def test_production_initializer_is_isolated_and_preserves_config():
+    text = _read('initialize-production.ps1')
+    assert 'Set-StrictMode -Version Latest' in text
+    assert 'runtime/production' in text and 'runtime/test' not in text
+    assert '"config/production.local.toml"' in text
+    assert '"import-machines", $ReferencePath' in text
+    assert '"--enable"' not in text
+    assert 'Remove-Item' not in text
+    launcher = (REPO_ROOT / 'initialize-production.bat').read_text(encoding='utf-8')
+    assert 'initialize-production.ps1' in launcher
+    assert '"%ComSpec%" /D /K' in launcher

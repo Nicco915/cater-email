@@ -50,6 +50,7 @@ class IngestResult:
     duplicate: bool = False
     filtered: bool = False
     filter_reason: str | None = None
+    reprocess_requested: bool = False
     should_process: bool = False
     supplement: bool = False
     needs_question: bool = False
@@ -327,6 +328,38 @@ class IntakeService:
                 needs_question=True,
                 note="invalid_supplement",
             )
+
+        if supplement.reprocess:
+            prior_confirmation = self.db.fetchone(
+                "SELECT id FROM mail_messages WHERE id<>? AND task_id=? AND "
+                "(raw_hash=? OR (message_id IS NOT NULL AND message_id<>'' AND message_id=?)) LIMIT 1",
+                (str(mail["id"]), str(task["id"]), mail["raw_hash"], mail.get("message_id")))
+            if prior_confirmation:
+                return self._filter(mail, "duplicate_reprocess_confirmation", task_id=str(task["id"]))
+            # A confirmation is a separate operation: never silently ignore edits
+            # or attachments bundled with it. Keep ownership/allowlist checks above.
+            if (supplement.destination or supplement.mappings or supplement.overrides
+                    or supplement.bare_fields or parsed.attachments):
+                return self._filter(mail, "reprocess_mixed_directives", task_id=str(task["id"]),
+                                    note="Reply only with 确认重新处理; send corrections separately.")
+            if task["status"] not in {state.COMPLETED, state.WAITING_INPUT,
+                                       state.FAILED, state.RETRY_PENDING, state.READY_TO_SEND}:
+                return self._filter(mail, "reprocess_status_blocked", task_id=str(task["id"]))
+            pending = self.db.fetchone(
+                "SELECT id FROM outbox WHERE task_id=? AND status IN ('pending','sending','send_unknown') LIMIT 1",
+                (str(task["id"]),))
+            if pending:
+                return self._filter(mail, "reprocess_delivery_unsettled", task_id=str(task["id"]))
+            # A late reply to an older version must not repeat a newer delivery.
+            import re
+            versions = re.findall(r"\[CATER\s+" + re.escape(str(task["id"])) + r"\s+v(\d+)\]",
+                                  parsed.subject or "", flags=re.I)
+            if versions and any(int(value) != version for value in versions):
+                return self._filter(mail, "reprocess_stale_version", task_id=str(task["id"]))
+            self.tasks.add_event(str(task["id"]), stage="intake", code="mail_reprocess_confirmed",
+                                 actor=str(task["owner"]), detail={"mail_id": mail["id"], "version": version})
+            return IngestResult(mail_id=str(mail["id"]), task_id=str(task["id"]),
+                                supplement=True, reprocess_requested=True)
 
         if not supplement.has_actions:
             issue = {

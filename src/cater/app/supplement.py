@@ -58,6 +58,7 @@ class OverrideDirective:
 @dataclass
 class SupplementParse:
     task_ids: list[str] = field(default_factory=list)
+    reprocess: bool = False
     destination: str | None = None
     mappings: list[CountryMapping] = field(default_factory=list)
     overrides: list[OverrideDirective] = field(default_factory=list)
@@ -68,7 +69,8 @@ class SupplementParse:
     @property
     def has_actions(self) -> bool:
         return bool(
-            self.destination
+            self.reprocess
+            or self.destination
             or self.mappings
             or self.overrides
             or self.bare_fields
@@ -122,6 +124,10 @@ def parse_supplement(parsed: ParsedMail) -> SupplementParse:
     for task_id in _extract_task_ids(body):
         if task_id not in result.task_ids:
             result.task_ids.append(task_id)
+
+    result.reprocess = any(line.strip() in {"重新处理", "确认重新处理"} for line in body.splitlines())
+    if result.reprocess:
+        result.directive_count += 1
 
     destinations = [match.group(1).strip() for match in _DEST_RE.finditer(body)]
     if destinations:

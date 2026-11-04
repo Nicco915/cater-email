@@ -282,7 +282,9 @@ class AppService:
     # ------------------------------------------------------------------
     def ingest(self, raw_message: RawMessage) -> IngestResult:
         result = self.intake.ingest(raw_message)
-        if result.should_process and result.task_id:
+        if result.reprocess_requested and result.task_id:
+            self.reprocess_task(result.task_id, actor="mail-owner")
+        elif result.should_process and result.task_id:
             self.process_task(result.task_id, actor="intake")
             task = self.tasks.require(result.task_id)
             if task["status"] == state.WAITING_INPUT:
@@ -738,7 +740,7 @@ class AppService:
                 "该邮件内容与已处理任务一致，本次未重复生成或发送业务文件。\n"
                 f"已有任务编号：{existing['id']}\n"
                 f"本次任务编号：{task_id}\n\n"
-                "如需重新处理，请由管理员在管理页明确执行重新处理。\n"
+                "如需重新处理，请由原发起人直接回复本邮件，新增正文仅写：确认重新处理。\n"
             )
             try:
                 notice, _ = self.delivery.enqueue_notice(
@@ -768,7 +770,7 @@ class AppService:
                 if item["status"]
                 not in {state.FAILED, state.RETRY_PENDING, state.CANCELLED}
             ]
-            if candidates and not task.get("reprocess_confirmed"):
+            if candidates and not reprocess_override:
                 candidate = candidates[0]
                 issue = {
                     "code": "REPROCESS_CONFIRMATION_REQUIRED",
@@ -783,7 +785,7 @@ class AppService:
                         {"kind": "task", "task_id": candidate["id"]},
                     ],
                     "required_action": (
-                        "管理员核对后确认重新处理；用户回复不会自动完成重新处理确认。"
+                        "请由原发起人回复本邮件，新增正文仅写：确认重新处理。"
                     ),
                     "blocking": True,
                 }
