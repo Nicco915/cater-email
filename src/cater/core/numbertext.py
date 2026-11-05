@@ -4,8 +4,9 @@
 - 金额与净重使用 Decimal，不从显示字符串引入千分位歧义；
 - Excel 二进制尾差在明确精度内处理（各字段按模板允许的最大小数位量化）；
 - SO 无前导零补一个，已有则保留，按文本存储；
-- 规格型号仅将开头 ``1||不适合进口报关`` 改为 ``1|不适合进口报关``，
-  其他连续竖线保持不变，不压缩申报要素分隔符。
+- 规格型号仅将开头的 ``1||`` 改为 ``1|``（已确认覆盖
+  ``1||不适合进口报关`` 与 ``1||3|`` 两种实际样例），
+  后续连续竖线（含空项）保持不变，不压缩申报要素分隔符。
 """
 from __future__ import annotations
 
@@ -20,9 +21,9 @@ MAX_DP_QTY = 5        # 申报数量：小数最多5位
 
 _NUM_CLEAN_RE = re.compile(r"[,，\s\xa0$¥￥]")
 
-# 已确认的唯一清洗规则：仅开头这一处双竖线改为单竖线
-_SPEC_PREFIX_BAD = "1||不适合进口报关"
-_SPEC_PREFIX_GOOD = "1|不适合进口报关"
+# 已确认的窄清洗规则：仅开头 1|| 改为 1|（多一个空项），不做通用 collapse
+_SPEC_PREFIX_BAD = "1||"
+_SPEC_PREFIX_GOOD = "1|"
 
 
 def to_decimal(value) -> Optional[Decimal]:
@@ -100,7 +101,10 @@ def normalize_so(text: str) -> str:
 
 
 def clean_spec(text: str) -> str:
-    """规格型号清洗：仅替换开头的 1||不适合进口报关，其余内容（含其他连续竖线）原样保留。"""
+    """规格型号清洗：仅替换开头的 ``1||`` 为 ``1|``（删除开头多出的一个空项）。
+
+    其余内容（含其他连续竖线与空项）原样保留，不做通用 collapse。
+    """
     if text is None:
         return text
     if text.startswith(_SPEC_PREFIX_BAD):

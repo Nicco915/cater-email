@@ -17,6 +17,7 @@ dependencies = [
   "itsdangerous==2.2.0",
   # Business core conversion dependencies (core-owned imports).
   "openpyxl==3.1.5",
+  "xlrd==2.0.2",          # 真正 BIFF .xls 只读解析（纯 Python，支持 Windows）
   "beautifulsoup4==4.15.0",
   "lxml==6.1.1",
   "et_xmlfile==2.0.0",

@@ -13,7 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 INPUT_PARTS = REPO_ROOT / "input" / "配件" / "1x920_BEECS-6613427.xlsx"
+INPUT_PARTS_NEW = REPO_ROOT / "input" / "配件" / "KM1X_BGVTG-6613563_655D.xlsx"
 INPUT_MACHINE_XLSX = REPO_ROOT / "input" / "整机" / "Invoice+Packing list ----2X512+2X520 BFWVN-VW.xlsx"
+INPUT_MACHINE_NEW_XLS = REPO_ROOT / "input" / "整机" / "CI PL ---2X656D BIHWE-WF.xls"
 MAIL_HTML_FIXTURE = Path(__file__).parent / "fixtures" / "machine_mail.html"
 DB_REFERENCE = REPO_ROOT / "database" / "整机HS CODE Review 2026-03.xlsx"
 TEMPLATE_DIR = REPO_ROOT / "templates"
@@ -56,6 +58,23 @@ def parts_request(output_dir):
         "kind": "parts",
         "destination": {"name": "多哥", "alpha3": "TGO"},
         "sources": [{"path": str(INPUT_PARTS), "filename": INPUT_PARTS.name,
+                     "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}],
+        "mail": {},
+        "references": {"machines": [], "countries": [], "machine_aliases": {}},
+        "output_dir": output_dir,
+        "overrides": [],
+    }
+
+
+@pytest.fixture()
+def parts_request_new(output_dir):
+    if not INPUT_PARTS_NEW.is_file():
+        pytest.skip("real new parts sample not available locally")
+    return {
+        "task_id": "TEST-PARTS-NEW",
+        "kind": "parts",
+        "destination": {"name": "多哥", "alpha3": "TGO"},
+        "sources": [{"path": str(INPUT_PARTS_NEW), "filename": INPUT_PARTS_NEW.name,
                      "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}],
         "mail": {},
         "references": {"machines": [], "countries": [], "machine_aliases": {}},

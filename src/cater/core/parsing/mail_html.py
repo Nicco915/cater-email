@@ -16,32 +16,40 @@ from typing import Optional
 from bs4 import BeautifulSoup
 
 from ..models import Issue, Source
+from .headers import normalize_header
 
-BUSINESS_KEY_HEADER = "cust. purch. order"
 QUOTE_CONTAINERS = {"blockquote"}
 
-# 业务表列名 → 标准字段名（表头文本规范化后精确匹配）
+# 业务表识别键：规范化后包含即视为业务表（大小写/空格/换行/标点不敏感）
+BUSINESS_KEY_HEADER = "custpurchorder"
+
+# 业务表列名 → 标准字段名（表头文本规范化后精确匹配；可配置别名见
+# HEADER_ALIASES_OVERRIDES 参数与 process_job 请求 header_aliases）
 COLUMN_MAP = {
     "region": "region",
     "order": "order",
-    "dealer order": "dealer_order",
-    "cust. purch. order (mso#)": "mso",
+    "dealerorder": "dealer_order",
+    "custpurchordermso": "mso",
+    "custpurchordermso号": "mso",
     "dealer": "dealer_code",
-    "ship-to party": "ship_to_party",
-    "dealer name": "dealer_name",
+    "dealercode": "dealer_code",
+    "shiptoparty": "ship_to_party",
+    "dealername": "dealer_name",
     "material": "material",
-    "serial number": "serial_number",
-    "net value (ord item)": "net_value",
-    "doc currency": "currency",
-    "order status": "order_status",
-    "dealer net net$": "dealer_net_net",
-    "inland freight": "inland_freight",
-    "ocean frieight": "ocean_freight",
-    "ocean freight": "ocean_freight",
+    "serialnumber": "serial_number",
+    "netvalueorditem": "net_value",
+    "doccurrency": "currency",
+    "orderstatus": "order_status",
+    "dealernetnet": "dealer_net_net",
+    "inlandfreight": "inland_freight",
+    "oceanfrieight": "ocean_freight",   # 历史样例中的原始拼写
+    "oceanfreight": "ocean_freight",
     "insurance": "insurance",
     "others": "others",
-    "total sales price": "total_sales_price",
+    "totalsalesprice": "total_sales_price",
 }
+
+_TEXT_HEADER_HINT = "custpurchorder"
 
 
 @dataclass
@@ -81,13 +89,13 @@ def _is_business_table(table) -> bool:
     first_row = table.find("tr")
     if first_row is None:
         return False
-    header = [_cell_text(c).lower() for c in first_row.find_all(["td", "th"])]
+    header = [normalize_header(_cell_text(c)) for c in first_row.find_all(["td", "th"])]
     return any(BUSINESS_KEY_HEADER in h for h in header)
 
 
 def _parse_table(table, table_index: int, message_id: Optional[str]) -> list:
     trs = table.find_all("tr")
-    header_cells = [_cell_text(c).lower() for c in trs[0].find_all(["td", "th"])]
+    header_cells = [normalize_header(_cell_text(c)) for c in trs[0].find_all(["td", "th"])]
     col_fields = [COLUMN_MAP.get(h) for h in header_cells]
     rows = []
     for ri, tr in enumerate(trs[1:], start=2):
@@ -139,15 +147,12 @@ def parse_mail_html(html: str, message_id: Optional[str]) -> MailParseResult:
     return result
 
 
-_TEXT_HEADER_HINT = "cust. purch. order"
-
-
 def parse_mail_text(text: str, message_id: Optional[str]) -> MailParseResult:
     """可明确分列的纯文本业务表：表头行含业务列名，数据行以 Tab 或 2+ 空格分列。"""
     result = MailParseResult()
     lines = [ln for ln in (text or "").splitlines() if ln.strip()]
     header_idx = next((i for i, ln in enumerate(lines)
-                       if _TEXT_HEADER_HINT in ln.lower()), None)
+                       if _TEXT_HEADER_HINT in normalize_header(ln)), None)
     if header_idx is None:
         return result
     header_line = lines[header_idx]
@@ -163,7 +168,7 @@ def parse_mail_text(text: str, message_id: Optional[str]) -> MailParseResult:
         ))
         return result
     split = (lambda s: s.split("\t")) if delim == "\t" else (lambda s: re.split(r"\s{2,}", s.strip()))
-    header = [h.strip().lower() for h in split(header_line)]
+    header = [normalize_header(h) for h in split(header_line)]
     col_fields = [COLUMN_MAP.get(h) for h in header]
     rows = []
     for off, ln in enumerate(lines[header_idx + 1:], start=1):

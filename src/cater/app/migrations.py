@@ -478,6 +478,22 @@ CREATE TABLE IF NOT EXISTS reference_tombstones (
 """
 
 
+MIGRATION_11 = """
+ALTER TABLE task_versions ADD COLUMN layout_json TEXT;
+
+-- 已确认表格布局：显式人工确认，不自动信任未知布局。
+-- 基准为已确认布局，不是上封邮件或未经确认的单次修正。
+CREATE TABLE IF NOT EXISTS confirmed_layouts (
+    kind            TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    structure_json  TEXT NOT NULL,
+    confirmed_at    TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    PRIMARY KEY (kind, fingerprint)
+);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", MIGRATION_1),
     Migration(2, "additional_indexes", MIGRATION_2),
@@ -489,4 +505,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(8, "lifecycle_reference_authority_import_preview", MIGRATION_8),
     Migration(9, "restored_task_retry_hold", MIGRATION_9),
     Migration(10, "reference_tombstones", MIGRATION_10),
+    Migration(11, "confirmed_layouts", MIGRATION_11),
 )

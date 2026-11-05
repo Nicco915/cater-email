@@ -7,6 +7,9 @@
 
 # 运行依赖（src/cater/core）
 openpyxl==3.1.5          # xlsx 读取与 OOXML 模板处理（往返保真已验证）
+xlrd==2.0.2              # 真正 BIFF .xls 只读解析（纯 Python、无外部进程；
+                         # xlrd 2.x 仅支持 .xls，xlsx 仍由 openpyxl 处理；
+                         # 已在 2026-11-05 实测安装并通过样例与全量测试）
 beautifulsoup4==4.15.0   # 邮件 HTML 业务表解析
 lxml==6.1.1              # BeautifulSoup 解析后端（实际安装并测试）
 et_xmlfile==2.0.0        # openpyxl 传递依赖，锁定

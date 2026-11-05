@@ -15,11 +15,14 @@ def test_so_adds_single_leading_zero():
 
 def test_spec_cleaning_only_confirmed_prefix():
     assert clean_spec("1||不适合进口报关|碳素钢|无") == "1|不适合进口报关|碳素钢|无"
+    # 已确认的第二种开头形态 1||3| 同样只删开头一个空项
+    assert clean_spec("1||3|用于SEM品牌|无") == "1|3|用于SEM品牌|无"
     # 其他连续竖线保持不变
     assert clean_spec("1|3|a|||b") == "1|3|a|||b"
     assert clean_spec("境内自主品牌|不适合进口报关|;x") == "境内自主品牌|不适合进口报关|;x"
-    # 非确认形态的开头 1|| 不动
-    assert clean_spec("1||其他|x") == "1||其他|x"
+    # 后续竖线空项保持，不做通用 collapse
+    assert clean_spec("1|a||b") == "1|a||b"
+    assert clean_spec("1||") == "1|"
 
 
 def test_decimal_text_quantization():

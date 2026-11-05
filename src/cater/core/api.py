@@ -2,6 +2,10 @@
 
 - ``process_job(request: dict) -> dict``：配件/整机离线转换。
   永不发送邮件、不写业务数据库；输入输出均为 JSON 可序列化 dict。
+- 附件支持 .xlsx 与真正 BIFF .xls（统一只读工作簿接口，见
+  parsing/workbook.py）；``header_aliases`` 可按字段配置表头别名。
+- 响应 ``layout`` 携带采用工作表、结构定位、已执行核对与规则 ID，
+  供上层做布局确认与回复正文展示（不含正文/秘密）。
 - ``import_machine_reference(path: str) -> list[dict]``：仅读机型库 Sheet1，
   供应用初始化本地机型表。
 """
@@ -16,10 +20,13 @@ from typing import Optional
 import openpyxl
 
 from .models import FieldValue, Issue, Source
+from .parsing.headers import merged_aliases, normalize_header
 from .parsing.mail_html import parse_mail_html, parse_mail_text
-from .parsing.machine_wb import parse_machine_workbook
+from .parsing.machine_wb import (INVOICE_NAME_KEYS, PACKING_NAME_KEYS,
+                                 parse_machine_workbook)
 from .parsing.parts import parse_parts_workbook
-from .parsing.xlsxutil import UnsupportedSourceError
+from .parsing.workbook import (SUPPORTED_SUFFIXES,
+                             UnsupportedSourceError, load_workbook_pair)
 from .reconcile import reconcile_machines
 from .references import CountryIndex, MachineIndex
 from .template_writer import (MACHINE_COMM_SPEC, MACHINE_MATERIALS_SPEC,
@@ -51,31 +58,31 @@ def _content_hash(kind: str, destination: Optional[dict], records: list) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _workbook_sheet_keys(path: str) -> Optional[list]:
+    """统一只读接口取 sheet 名列表（规范化小写键）；无法读取返回 None。"""
+    if not str(path).lower().endswith(SUPPORTED_SUFFIXES):
+        return None
+    try:
+        wb, _ = load_workbook_pair(path)
+        names = [normalize_header(n) for n in wb.sheetnames]
+        if hasattr(wb, "close"):
+            wb.close()
+        return names
+    except UnsupportedSourceError:
+        return None
+    except Exception:
+        return None
+
+
 def _classify(sources: list, mail: dict) -> str:
-    """kind=auto 时的业务识别：配件看 CI-For Dealer 表，整机看机器信息表或业务表。"""
+    """kind=auto 时的业务识别：配件看 CI-For Dealer 表，整机看业务表别名或机器信息表。"""
     for src in sources:
-        path = src.get("path", "")
-        if not str(path).lower().endswith(".xlsx"):
-            continue
-        try:
-            wb = openpyxl.load_workbook(path, read_only=True)
-        except Exception:
-            continue
-        names = [n.strip().lower() for n in wb.sheetnames]
-        wb.close()
-        if any(n.startswith("ci-for dealer") for n in names):
+        names = _workbook_sheet_keys(src.get("path", ""))
+        if names and any(n.startswith("cifordealer") for n in names):
             return "parts"
     for src in sources:
-        path = src.get("path", "")
-        if not str(path).lower().endswith(".xlsx"):
-            continue
-        try:
-            wb = openpyxl.load_workbook(path, read_only=True)
-        except Exception:
-            continue
-        names = {n.strip().lower() for n in wb.sheetnames}
-        wb.close()
-        if "invoice" in names or "packing list" in names:
+        names = _workbook_sheet_keys(src.get("path", ""))
+        if names and (INVOICE_NAME_KEYS & set(names) or PACKING_NAME_KEYS & set(names)):
             return "machine"
     if (mail or {}).get("html") or (mail or {}).get("text"):
         return "machine"
@@ -105,7 +112,8 @@ def _apply_overrides(records_fields: dict, overrides: list, issues: list) -> Non
 
 def _build_response(status: str, kind: str, records: list, issues: list,
                     artifacts: list, provenance: list,
-                    business_identity: Optional[str], content_hash: str) -> dict:
+                    business_identity: Optional[str], content_hash: str,
+                    layout: Optional[dict] = None) -> dict:
     return {
         "status": status,
         "kind": kind,
@@ -115,7 +123,66 @@ def _build_response(status: str, kind: str, records: list, issues: list,
         "provenance": provenance,
         "business_identity": business_identity,
         "content_hash": content_hash,
+        "layout": layout or {},
     }
+
+
+def _table_structure(t: dict) -> dict:
+    """结构指纹用的表投影：只含定位信息，不含行数/数值/明细。"""
+    return {"sheet": t.get("sheet"),
+            "header_row": t.get("header_row"),
+            "subheader_row": t.get("subheader_row"),
+            "columns": t.get("columns") or {},
+            "supplementary": t.get("supplementary") or {}}
+
+
+def canonical_structure(kind: str, layout: dict, alias_marker: str) -> dict:
+    """规范化 STRUCTURE-ONLY 投影：同一模板新一票（不同料号/数量/重量、
+    不同记录条数）必须得到相同指纹；表按语义角色键归并（不按 sheet 名），
+    因此 sheet 重命名会体现为结构变化，而记录数导致的 TOTAL/数据结束行
+    移动不影响指纹。
+
+    排除：checks 的证据明细（record_key/detail 含真实值）、total_row、
+    data_first_row/data_last_row（随记录数变化）、任何数值/正文。
+    """
+    tables: dict = {}
+    for key in ("parts_invoice", "packing_total"):
+        t = layout.get(key)
+        if isinstance(t, dict) and t.get("sheet"):
+            tables[key] = _table_structure(t)
+    for key in ("machine_table", "weight_table"):
+        for index, t in enumerate(layout.get(key) or []):
+            if isinstance(t, dict) and t.get("sheet"):
+                tables[f"{key}#{index}"] = _table_structure(t)
+    return {"kind": kind, "alias_sets": alias_marker, "tables": tables}
+
+
+def _alias_marker(request_aliases) -> str:
+    """别名集标记：默认集固定版本号；自定义别名以其规范化并集哈希标记，
+    使别名配置变化体现为结构边界（且不含任何正文/秘密）。"""
+    if not request_aliases:
+        return "default-v1"
+    canonical = json.dumps(
+        {name: sorted(keys) for name, keys in sorted(request_aliases.items())},
+        ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"custom-{digest}"
+
+
+def _layout_block(kind: str, layout: dict, request_aliases=None) -> dict:
+    """整理布局上报块并计算结构指纹（不含正文/秘密，仅结构与规则ID）。
+
+    指纹只覆盖 canonical_structure 投影；checks 证据（含 record_key/
+    detail 真实值）原样保留在块内供追溯，不参与指纹。
+    request_aliases 为请求级原始配置（非合并结果），用于别名边界标记。
+    """
+    alias_marker = _alias_marker(request_aliases)
+    structure = canonical_structure(kind, layout, alias_marker)
+    canonical = json.dumps(structure, ensure_ascii=False, sort_keys=True,
+                           default=str)
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return {"kind": kind, "fingerprint": fingerprint,
+            "alias_sets": alias_marker, "structure": structure, **layout}
 
 
 def _finalize_status(issues: list) -> str:
@@ -134,6 +201,7 @@ def process_job(request: dict) -> dict:
     output_dir = request.get("output_dir") or os.path.join(
         os.environ.get("CATER_OUTPUT_DIR", tempfile_get()), task_id or "job")
     overrides = request.get("overrides", []) or []
+    header_aliases = merged_aliases(request.get("header_aliases"))
 
     country_index = CountryIndex(
         references.get("countries"),
@@ -157,14 +225,16 @@ def process_job(request: dict) -> dict:
             "unsupported", "unsupported", [],
             [Issue(code="UNSUPPORTED_BUSINESS",
                    message="无法识别业务类型：既非配件发票也非整机资料",
-                   required_action="请提供配件发票 xlsx 或整机发票箱单 xlsx 及业务表")],
+                   required_action="请提供配件发票或整机发票箱单（xlsx 或 xls）及业务表")],
             [], [], None, _content_hash("unsupported", destination, []))
 
     if kind == "parts":
         return _process_parts(task_id, destination, sources, country_index,
-                              output_dir, overrides, issues)
+                              output_dir, overrides, issues, header_aliases,
+                              request.get("header_aliases"))
     return _process_machine(task_id, destination, sources, mail, country_index,
-                            machine_index, output_dir, overrides, issues)
+                            machine_index, output_dir, overrides, issues,
+                            header_aliases, request.get("header_aliases"))
 
 
 def tempfile_get() -> str:
@@ -173,21 +243,16 @@ def tempfile_get() -> str:
 
 
 def _pick_workbook(sources: list, want: str, issues: list):
-    """从 sources 中挑选含目标工作表的 xlsx；返回 (path, filename) 或 (None, None)。"""
+    """从 sources 中挑选含目标工作表的 xlsx/xls；返回 (path, filename) 或 (None, None)。"""
     matches = []
     for src in sources:
-        path = src.get("path", "")
-        if not str(path).lower().endswith(".xlsx"):
+        names = _workbook_sheet_keys(src.get("path", ""))
+        if names is None:
             continue
-        try:
-            wb = openpyxl.load_workbook(path, read_only=True)
-        except Exception:
-            continue
-        names = [n.strip().lower() for n in wb.sheetnames]
-        wb.close()
-        if want == "parts" and any(n.startswith("ci-for dealer") for n in names):
+        if want == "parts" and any(n.startswith("cifordealer") for n in names):
             matches.append(src)
-        if want == "machine" and ({"invoice", "packing list"} & set(names)):
+        if want == "machine" and (INVOICE_NAME_KEYS & set(names)
+                                  or PACKING_NAME_KEYS & set(names)):
             matches.append(src)
     if len(matches) > 1:
         issues.append(Issue(
@@ -202,7 +267,8 @@ def _pick_workbook(sources: list, want: str, issues: list):
 
 
 def _process_parts(task_id, destination, sources, country_index,
-                   output_dir, overrides, issues) -> dict:
+                   output_dir, overrides, issues, header_aliases,
+                   raw_aliases=None) -> dict:
     path, filename = _pick_workbook(sources, "parts", issues)
     if path is None:
         if not any(i.code == "AMBIGUOUS_INPUT" for i in issues):
@@ -211,20 +277,20 @@ def _process_parts(task_id, destination, sources, country_index,
                 issues.append(Issue(
                     code="UNSUPPORTED_FILE",
                     message="附件中未找到配件发票工作簿（CI-For Dealer）",
-                    required_action="请补充含 CI-For Dealer (2) 的 xlsx 附件"))
+                    required_action="请补充含 CI-For Dealer (2) 的 xlsx 或 xls 附件"))
             else:
                 issues.append(Issue(
                     code="MISSING_SOURCE",
                     message="缺少配件发票附件",
-                    required_action="请补充配件发票 xlsx 附件"))
+                    required_action="请补充配件发票 xlsx 或 xls 附件"))
         return _build_response("waiting_input", "parts", [], issues, [], [],
                                None, _content_hash("parts", destination, []))
     try:
-        parsed = parse_parts_workbook(path, filename)
+        parsed = parse_parts_workbook(path, filename, aliases=header_aliases)
     except UnsupportedSourceError as exc:
         return _build_response("unsupported", "parts", [],
                                [Issue(code="UNSUPPORTED_FILE", message=str(exc),
-                                      required_action="请补充 xlsx 格式附件")],
+                                      required_action="请补充 xlsx 或 xls 格式附件")],
                                [], [], None, _content_hash("parts", destination, []))
     issues.extend(parsed.issues)
 
@@ -237,7 +303,7 @@ def _process_parts(task_id, destination, sources, country_index,
     record_map = {r.part_code: r.fields for r in parsed.records}
     _apply_overrides(record_map, overrides, issues)
 
-    rows, json_records, provenance = build_parts_rows(
+    rows, json_records, provenance, normalizations = build_parts_rows(
         parsed.records, country_index, destination,
         parsed.gross_weight, parsed.packages, parsed.invoice_no,
         parsed.gross_source, parsed.packages_source, parsed.invoice_source,
@@ -256,29 +322,44 @@ def _process_parts(task_id, destination, sources, country_index,
             status = "waiting_input"
             artifacts = []
     identity = parsed.invoice_no
+    layout = _layout_block("parts", {
+        "sheets": [t.get("sheet") for t in (parsed.layout.get("parts_invoice", {}),)
+                   if isinstance(t, dict) and t.get("sheet")]
+                   + [t.get("sheet") for t in (parsed.layout.get("packing_total", {}),)
+                      if isinstance(t, dict) and t.get("sheet")],
+        "parts_invoice": parsed.layout.get("parts_invoice", {}),
+        "packing_total": parsed.layout.get("packing_total", {}),
+        "checks": parsed.layout.get("checks", []),
+        # 自动窄规范化（如 1|| → 1|）与实际值证据随版本保存，供“实际修正”
+        # 节展示；不参与结构指纹（canonical_structure 只读定位键）。
+        "corrections": normalizations,
+    }, request_aliases=raw_aliases)
     return _build_response(status, "parts", json_records, issues, artifacts,
                            provenance, identity,
-                           _content_hash("parts", destination, json_records))
+                           _content_hash("parts", destination, json_records),
+                           layout=layout)
 
 
 def _process_machine(task_id, destination, sources, mail, country_index,
-                     machine_index, output_dir, overrides, issues) -> dict:
+                     machine_index, output_dir, overrides, issues,
+                     header_aliases, raw_aliases=None) -> dict:
     path, filename = _pick_workbook(sources, "machine", issues)
     wb_result = None
     if path is not None:
         try:
-            wb_result = parse_machine_workbook(path, filename)
+            wb_result = parse_machine_workbook(path, filename,
+                                               aliases=header_aliases)
         except UnsupportedSourceError as exc:
             return _build_response("unsupported", "machine", [],
                                    [Issue(code="UNSUPPORTED_FILE", message=str(exc),
-                                          required_action="请补充 xlsx 格式附件")],
+                                          required_action="请补充 xlsx 或 xls 格式附件")],
                                    [], [], None, _content_hash("machine", destination, []))
         issues.extend(wb_result.issues)
     else:
         issues.append(Issue(
             code="MISSING_SOURCE",
             message="缺少整机发票箱单附件，净重、序列号等无法取得",
-            required_action="请补充 Invoice+Packing list xlsx 附件"))
+            required_action="请补充 Invoice+Packing list（或 CI/PL）xlsx 或 xls 附件"))
 
     mail_result = None
     if mail.get("html"):
@@ -338,9 +419,21 @@ def _process_machine(task_id, destination, sources, mail, country_index,
     msos = sorted(r.mso for r in rec_result.records)
     invoice_no = wb_result.invoice_no if wb_result else None
     identity = "|".join(msos) + (f"|{invoice_no}" if invoice_no else "") if msos else None
+    layout = {}
+    if wb_result is not None:
+        layout = _layout_block("machine", {
+            "sheets": sorted({t.get("sheet") for t in
+                              wb_result.layout.get("machine_table", [])
+                              + wb_result.layout.get("weight_table", [])
+                              if isinstance(t, dict) and t.get("sheet")}),
+            "machine_table": wb_result.layout.get("machine_table", []),
+            "weight_table": wb_result.layout.get("weight_table", []),
+            "checks": wb_result.layout.get("checks", []),
+        }, request_aliases=raw_aliases)
     return _build_response(status, "machine", json_records, issues, artifacts,
                            provenance, identity,
-                           _content_hash("machine", destination, json_records))
+                           _content_hash("machine", destination, json_records),
+                           layout=layout)
 
 
 def import_machine_reference(path: str) -> list:

@@ -45,7 +45,7 @@ def test_existing_database_is_upgraded_without_losing_reference_rows(
 
     database = Database(path)
     try:
-        assert database.schema_version() == 10
+        assert database.schema_version() == 11
         assert database.quick_check() == "ok"
         rows = [dict(row) for row in database.fetchall("SELECT * FROM machine_materials")]
         assert len(rows) == 1
@@ -117,7 +117,7 @@ def test_nonempty_old_db_upgrades_keeping_tasks_and_outbox(tmp_path: Path) -> No
 
     database = Database(path)
     try:
-        assert database.schema_version() == 10
+        assert database.schema_version() == 11
         assert database.quick_check() == "ok"
         # Task and outbox preserved.
         assert database.scalar("SELECT COUNT(*) FROM tasks") == 1
@@ -164,3 +164,51 @@ def test_failed_migration_rolls_back_all_statements(
         ).fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def test_migration_11_layout_columns_and_confirmed_table(tmp_path: Path) -> None:
+    """布局持久化：task_versions.layout_json 列与 confirmed_layouts 表。"""
+    database = Database(tmp_path / "fresh.sqlite3")
+    try:
+        assert database.schema_version() == 11
+        columns = {
+            row[1]
+            for row in database.fetchall("PRAGMA table_info(task_versions)")
+        }
+        assert "layout_json" in columns
+        tables = {
+            row[0]
+            for row in database.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "confirmed_layouts" in tables
+        # 确认布局可存取（UPSERT 语义 + 主键(kind, fingerprint)）
+        database.insert(
+            """
+            INSERT INTO confirmed_layouts (kind, fingerprint, structure_json,
+                confirmed_at, actor) VALUES ('parts', 'fp1', '{}', 't', 'a')
+            ON CONFLICT (kind, fingerprint) DO UPDATE SET
+                structure_json = excluded.structure_json,
+                confirmed_at = excluded.confirmed_at,
+                actor = excluded.actor
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO confirmed_layouts (kind, fingerprint, structure_json,
+                confirmed_at, actor) VALUES ('parts', 'fp1', '{"v":2}', 't2', 'b')
+            ON CONFLICT (kind, fingerprint) DO UPDATE SET
+                structure_json = excluded.structure_json,
+                confirmed_at = excluded.confirmed_at,
+                actor = excluded.actor
+            """
+        )
+        assert database.scalar("SELECT COUNT(*) FROM confirmed_layouts") == 1
+        row = database.fetchone(
+            "SELECT structure_json, actor FROM confirmed_layouts WHERE kind = 'parts'"
+        )
+        assert row["structure_json"] == '{"v":2}'
+        assert row["actor"] == "b"
+    finally:
+        database.close()

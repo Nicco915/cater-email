@@ -38,6 +38,12 @@
       <button type="submit" class="danger">确认重新处理</button>
     </form>
     {% endif %}
+    {% if layout and not layout_confirmed %}
+    <form method="post" action="/tasks/{{ task.id }}/confirm-layout">
+      {% include "_csrf.html" %}
+      <button type="submit">确认表格布局（fingerprint {{ layout.fingerprint[:10] }}…）</button>
+    </form>
+    {% endif %}
     {% if task.status == "READY_TO_SEND" %}
     <form method="post" action="/tasks/{{ task.id }}/deliver">
       {% include "_csrf.html" %}
@@ -169,6 +175,21 @@
     </tbody>
   </table>
   {% else %}<p class="empty">当前版本没有输出文件。</p>{% endif %}
+</section>
+
+<section class="panel">
+  <h2>表格布局</h2>
+  {% if layout %}
+  <table class="grid">
+    <tbody>
+      <tr><th>类型</th><td>{{ layout.kind }}</td></tr>
+      <tr><th>结构指纹</th><td class="mono">{{ layout.fingerprint }}</td></tr>
+      <tr><th>采用工作表</th><td>{{ layout.sheets | join("、") }}</td></tr>
+      <tr><th>已确认</th><td>{{ "是" if layout_confirmed else "否（首次使用，交付邮件将提示人工重点核对）" }}</td></tr>
+      <tr><th>已执行核对数</th><td>{{ layout.checks | length }}</td></tr>
+    </tbody>
+  </table>
+  {% else %}<p class="empty">当前版本没有布局信息。</p>{% endif %}
 </section>
 
 <section class="panel">

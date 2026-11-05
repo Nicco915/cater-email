@@ -31,6 +31,7 @@ class FakeEngine:
     content_hash: str = "content-hash-ready"
     business_identity: str | None = None
     artifact_count: int = 1
+    layout: dict[str, Any] | None = None
     records: list[dict[str, Any]] = field(
         default_factory=lambda: [{"record_key": "P1", "part_code": "P1", "qty": 1}]
     )
@@ -115,6 +116,7 @@ class FakeEngine:
             ],
             "business_identity": self.business_identity,
             "content_hash": self.content_hash,
+            "layout": self.layout,
         }
 
 
@@ -178,12 +180,21 @@ def make_mail(
     message.set_content(text)
     if html is not None:
         message.add_alternative(html, subtype="html")
-    for filename, data in attachments:
-        maintype, subtype = (
-            ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            if filename.lower().endswith(".xlsx")
-            else ("application", "octet-stream")
-        )
+    for entry in attachments:
+        filename, data = entry[0], entry[1]
+        if len(entry) > 2 and entry[2]:
+            maintype, subtype = entry[2].split("/", 1)
+        else:
+            lower = filename.lower()
+            if lower.endswith(".xlsx"):
+                maintype, subtype = (
+                    "application",
+                    "vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            elif lower.endswith(".xls"):
+                maintype, subtype = "application", "vnd.ms-excel"
+            else:
+                maintype, subtype = "application", "octet-stream"
         message.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
     return message.as_bytes()
 

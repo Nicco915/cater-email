@@ -100,6 +100,12 @@ def validate_core_response(response: Any, *, output_dir: Path) -> dict[str, Any]
     if status == "ready" and not artifacts:
         raise ValidationError("core returned ready without output artifacts")
 
+    layout = response.get("layout")
+    if layout is not None and not isinstance(layout, dict):
+        raise ValidationError("core layout must be a dict")
+    if isinstance(layout, dict) and len(str(layout)) > 200_000:
+        raise ValidationError("core layout is unreasonably large")
+
     return {
         "status": status,
         "kind": kind,
@@ -109,4 +115,5 @@ def validate_core_response(response: Any, *, output_dir: Path) -> dict[str, Any]
         "provenance": [item for item in provenance if isinstance(item, dict)],
         "business_identity": response.get("business_identity"),
         "content_hash": response.get("content_hash"),
+        "layout": layout or {},
     }

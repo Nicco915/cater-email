@@ -379,6 +379,72 @@ class TaskRepository:
             ),
         )
 
+    # ------------------------------------------------------------------
+    # 表格布局（采用工作表/结构定位/核对结果；不含正文或秘密）
+    # ------------------------------------------------------------------
+    def save_layout(self, task_id: str, version: int, layout: dict) -> None:
+        if not layout:
+            return
+        self.db.insert(
+            "UPDATE task_versions SET layout_json = ? WHERE task_id = ? AND version = ?",
+            (json.dumps(layout, ensure_ascii=False, sort_keys=True, default=str),
+             task_id, version),
+        )
+
+    def layout(self, task_id: str, version: int) -> dict | None:
+        row = self.db.fetchone(
+            "SELECT layout_json FROM task_versions WHERE task_id = ? AND version = ?",
+            (task_id, version),
+        )
+        raw = row["layout_json"] if row else None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def find_confirmed_layout(self, kind: str, fingerprint: str) -> dict | None:
+        return _row(self.db.fetchone(
+            "SELECT * FROM confirmed_layouts WHERE kind = ? AND fingerprint = ?",
+            (kind, fingerprint),
+        ))
+
+    def latest_confirmed_layout(self, kind: str) -> dict | None:
+        return _row(self.db.fetchone(
+            "SELECT * FROM confirmed_layouts WHERE kind = ? "
+            "ORDER BY confirmed_at DESC LIMIT 1",
+            (kind,),
+        ))
+
+    def confirm_layout(self, kind: str, fingerprint: str, structure: dict,
+                       *, actor: str) -> dict:
+        """显式确认布局（人工动作，审计事件）；重复确认幂等。"""
+        now = utc_now()
+        existing = self.find_confirmed_layout(kind, fingerprint)
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO confirmed_layouts (
+                    kind, fingerprint, structure_json, confirmed_at, actor
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (kind, fingerprint) DO UPDATE SET
+                    structure_json = excluded.structure_json,
+                    confirmed_at = excluded.confirmed_at,
+                    actor = excluded.actor
+                """,
+                (kind, fingerprint,
+                 json.dumps(structure, ensure_ascii=False, sort_keys=True, default=str),
+                 now, actor),
+            )
+        self.logger.info(
+            "layout_confirmed", kind=kind, fingerprint=fingerprint,
+            actor=actor, reconfirmed=existing is not None,
+        )
+        row = self.find_confirmed_layout(kind, fingerprint)
+        assert row is not None
+        return row
+
     def set_retry_state(
         self,
         task_id: str,
@@ -930,6 +996,7 @@ class TaskRepository:
         output_dir: str | None,
         status: str,
         record_count: int = 0,
+        layout: dict | None = None,
     ) -> None:
         now = utc_now()
         with self.db.transaction() as conn:
@@ -937,7 +1004,8 @@ class TaskRepository:
                 """
                 UPDATE task_versions
                    SET content_hash = ?, business_identity = ?, template_hash = ?,
-                       output_dir = ?, status = ?, processed_at = ?, record_count = ?
+                       output_dir = ?, status = ?, processed_at = ?, record_count = ?,
+                       layout_json = ?
                  WHERE task_id = ? AND version = ?
                 """,
                 (
@@ -948,6 +1016,8 @@ class TaskRepository:
                     status,
                     now,
                     max(0, int(record_count)),
+                    json.dumps(layout, ensure_ascii=False, sort_keys=True,
+                               default=str) if layout else None,
                     task_id,
                     version,
                 ),

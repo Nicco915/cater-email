@@ -360,6 +360,18 @@ def create_app(
             success="已确认重新处理",
         )
 
+    @app.post("/tasks/{task_id}/confirm-layout")
+    async def task_confirm_layout(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        task_or_404(task_id)
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.confirm_layout(task_id, actor="web-admin"),
+            success="已确认该表格布局为基准布局",
+        )
+
     @app.post("/tasks/{task_id}/deliver")
     async def task_deliver(request: Request, task_id: str):
         form = await form_data(request)

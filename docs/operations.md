@@ -85,6 +85,21 @@ production = []
 - `production` 模式必须至少有一个生产地址。
 - 网页“设置”和 `settings` 命令修改的是 SQLite 中的运行时配置，并写入 `config_versions` 审计表；配置文件仍是基线。
 
+### 3.2.1 语义表头别名（可选）
+
+客户工作簿表头写法漂移（如单价写成 `Final Price`、机型写成 `Type`）时，
+在 `config.toml` 追加本地别名，配件与整机解析共用；随任务请求快照持久化，
+重试不依赖当时配置，也不写入指纹之外的任何地方：
+
+```toml
+[core.header_aliases]
+unit_price = ["Final Price", "结算价"]
+model = ["Type"]
+```
+
+别名只影响**表头匹配**，不改业务规则；别名集合差异会体现为布局变化。
+语法与更多语义定位规则见 `docs/flexible-input.md` §2。
+
 ### 3.3 发送开关
 
 ```toml
@@ -125,7 +140,7 @@ $env:CATER_SMTP_PASSWORD = "..."
 
 先复制样例输入到临时目录，或用 `--runtime` 指定独立运行目录，避免污染生产数据库。
 
-### 4.1 配件 xlsx
+### 4.1 配件工作簿（xlsx / xls）
 
 ```powershell
 .venv\Scripts\python.exe -m cater.app.cli process `
@@ -147,7 +162,7 @@ $env:CATER_SMTP_PASSWORD = "..."
   --source "input\整机\回复 Re 印尼 ....msg"
 ```
 
-`.msg` 由 `extract-msg` 解析：正文 HTML/纯文本进入核心业务表格提取，xlsx 附件作为业务来源；原始 `.msg` 保留用于审计，但不会作为核心的 xlsx 来源。整机成功时生成两个 Excel（企业物料上传、发运沟通表）。
+`.msg` 由 `extract-msg` 解析：正文 HTML/纯文本进入核心业务表格提取，xlsx/xls 附件作为业务来源；原始 `.msg` 保留用于审计，但不会作为核心的工作簿来源。整机成功时生成两个 Excel（企业物料上传、发运沟通表）。真正 BIFF `.xls` 由 xlrd（纯 Python）解析，无需安装 Excel。
 
 ### 4.3 标准 `.eml`
 
@@ -159,7 +174,7 @@ $env:CATER_SMTP_PASSWORD = "..."
 
 ### 4.4 附件型离线来源
 
-`--source` 也接受 `.eml`；对 `.msg`/`.eml` 会提取 xlsx/xlsm 附件。非 xlsx 附件不会进入核心业务来源。离线命令的 `--sender` 必须命中当前允许名单。
+`--source` 也接受 `.eml`；对 `.msg`/`.eml` 会提取 xlsx/xlsm/xls 附件。非工作簿附件不会进入核心业务来源。离线命令的 `--sender` 必须命中当前允许名单。
 
 ## 5. 常驻运行
 
@@ -243,12 +258,18 @@ PowerShell -ExecutionPolicy Bypass -File scripts\register-tasks.ps1 -Remove
 .venv\Scripts\python.exe -m cater.app.cli reprocess task_xxxxxxxx --regenerate-only
 .venv\Scripts\python.exe -m cater.app.cli reprocess task_xxxxxxxx
 .venv\Scripts\python.exe -m cater.app.cli confirm-reprocess task_xxxxxxxx
+.venv\Scripts\python.exe -m cater.app.cli confirm-layout task_xxxxxxxx
 .venv\Scripts\python.exe -m cater.app.cli deliver task_xxxxxxxx
 .venv\Scripts\python.exe -m cater.app.cli outbox
 ```
 
 - `reprocess --regenerate-only`：生成新版本和输出，但不创建交付邮件。
 - `reprocess`：生成新版本并创建交付；若任务处于需要明确确认的状态，先执行 `confirm-reprocess`。
+- `confirm-layout`：把任务当前版本采用的表格布局确认为该类业务的基准布局
+  （网页任务页有等价按钮）。首次使用的新布局会在交付正文中给出人工重点核对建议；
+  人工核对无误后执行一次确认，之后同类布局不再重复提示，相对基线的结构变化
+  （表头行/列位/TOTAL 行移动）会在正文中列出。确认只记录结构指纹与工作表，
+  不记录正文。详见 docs/flexible-input.md §4。
 - 旧版本和旧输出保留；管理操作始终作用于当前版本。
 - `deliver` 只对 `READY_TO_SEND` 有效；dry-run 时只标记 `dry_run`。
 - 后台轮询每轮会发送到期的发件箱、重试可重试任务并执行每日维护。
@@ -274,7 +295,7 @@ SO=...
 - `修正` 必须带记录键和字段名；一条补件对同一字段给出不同值会报冲突。
 - `MSO=` / `SO=` 仅在任务恰好只有一个未完成记录键时可用；否则必须写完整 `修正：...`。
 - 含糊的自然语言（如“改成法国吧”）不会被解释为修改。
-- 附件补件必须是可识别的 xlsx；无法保存附件时任务保持等待并记录问题。
+- 附件补件必须是可识别的 xlsx/xls 工作簿；无法保存附件时任务保持等待并记录问题。
 
 ### 6.2 国家与机型资料
 
@@ -374,7 +395,7 @@ PowerShell -ExecutionPolicy Bypass -File scripts\backup.ps1
 | 邮件未进入任务 | 检查 `allowlist.mode` 与当前名单、发件人最外层 From、自动回复/退信过滤、`logs` |
 | 首次运行没有处理旧邮件 | 设计如此；确认后 `poll --history` 仅首轮处理历史 |
 | 重复邮件 | 按 `Message-ID`/原始哈希去重；检查是否有不同 Message-ID 的重复投递 |
-| 附件未识别 | 仅支持 xlsx/xlsm 业务附件；检查大小上限与日志中的 `attachment_*` 警告 |
+| 附件未识别 | 仅支持 xlsx/xlsm/xls 业务附件（按扩展名或工作簿 MIME 识别）；检查大小上限与日志中的 `attachment_*` 警告 |
 | 机型导入失败（915F 等重复） | 同机型同目的国范围但申报不同会被核心拒绝；确认是否为已定义的特殊范围（如 915F/BRA），未定义的特殊值不得推广猜测 |
 | 网页 400 | 访问地址必须是 `127.0.0.1`/`localhost`，服务拒绝非回环 Host |
 | 网页 403 | CSRF Token 缺失/过期；刷新页面重试 |

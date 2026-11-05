@@ -135,6 +135,18 @@ class PathsConfig:
 
 
 @dataclass(frozen=True)
+class CoreConfig:
+    """核心业务解析配置（不含秘密）。
+
+    header_aliases：表头语义别名，{字段: [别名, ...]}，按业务字段追加
+    到内置别名集（规范化后精确匹配，不做模糊匹配）。配件与整机解析
+    共用；每个任务版本的 request.json 快照都会携带，重试不重读配置。
+    """
+
+    header_aliases: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
     mail: MailConfig = field(default_factory=MailConfig)
@@ -142,6 +154,7 @@ class AppConfig:
     sending: SendingConfig = field(default_factory=SendingConfig)
     web: WebConfig = field(default_factory=WebConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    core: CoreConfig = field(default_factory=CoreConfig)
 
     # ----- derived paths -------------------------------------------------
     @property
@@ -263,6 +276,7 @@ def load_config(
     web_raw = raw.get("web", {})
     logging_raw = raw.get("logging", {})
     runtime_raw = raw.get("runtime", {})
+    core_raw = raw.get("core", {})
     for name, value in (
         ("mail", mail_raw),
         ("allowlist", allow_raw),
@@ -270,6 +284,7 @@ def load_config(
         ("web", web_raw),
         ("logging", logging_raw),
         ("runtime", runtime_raw),
+        ("core", core_raw),
     ):
         if not isinstance(value, dict):
             raise ConfigurationError(f"{name} must be a table")
@@ -358,6 +373,20 @@ def load_config(
         ),
     )
 
+    header_aliases: dict = {}
+    aliases_raw = core_raw.get("header_aliases", {})
+    if aliases_raw:
+        if not isinstance(aliases_raw, dict):
+            raise ConfigurationError("core.header_aliases must be a table")
+        for field_name, names in aliases_raw.items():
+            if not isinstance(field_name, str) or not field_name.strip():
+                raise ConfigurationError("core.header_aliases keys must be field names")
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise ConfigurationError(
+                    f"core.header_aliases.{field_name} must be a list of strings")
+            header_aliases[field_name.strip()] = [n.strip() for n in names if n.strip()]
+    core = CoreConfig(header_aliases=header_aliases)
+
     config = AppConfig(
         paths=PathsConfig(runtime_dir=chosen_runtime, config_path=chosen_path if chosen_path.exists() else None),
         mail=mail,
@@ -365,6 +394,7 @@ def load_config(
         sending=sending,
         web=web,
         logging=logging_cfg,
+        core=core,
     )
     validate_config(config)
     return config

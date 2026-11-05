@@ -80,6 +80,138 @@ class PollReport:
         }
 
 
+
+def _semantic_tables(layout: dict) -> dict:
+    """按语义角色归并结构表（不按 sheet 名）：sheet 重命名、增删表
+    都会被差异对比发现。"""
+    roles: dict[str, dict] = {}
+    for key in ("parts_invoice", "packing_total"):
+        t = layout.get(key)
+        if isinstance(t, dict) and t.get("sheet"):
+            roles[key] = t
+    for key in ("machine_table", "weight_table"):
+        for index, t in enumerate(layout.get(key) or []):
+            if isinstance(t, dict) and t.get("sheet"):
+                roles[f"{key}#{index}"] = t
+    return roles
+
+
+_ROLE_LABELS = {
+    "parts_invoice": "最终发票表",
+    "packing_total": "箱单TOTAL",
+}
+
+
+def _role_label(role: str) -> str:
+    if role in _ROLE_LABELS:
+        return _ROLE_LABELS[role]
+    for key, label in (("machine_table#", "机器信息表"),
+                       ("weight_table#", "箱单重量表")):
+        if role.startswith(key):
+            suffix = role[len(key):]
+            return f"{label}（第{int(suffix) + 1}张）" if suffix.isdigit() else label
+    return role
+
+
+_FIELD_LABELS = {
+    "part_code": "料号", "qty": "数量", "unit_price": "单价",
+    "coo": "原产国", "unit_weight": "单件重", "net_weight": "总净重",
+    "hs_code_titled": "表头HS",
+    "packages": "件数", "gross_weight": "总毛重",
+    "model": "机型", "mso": "MSO", "serial": "序列号", "pin": "PIN",
+    "engine": "发动机号",
+    "description": "品名", "net": "净重", "gross": "毛重",
+}
+
+
+def _table_column_lines(layout: dict) -> list[str]:
+    """本版采用表的字段列位行（不依赖差异对比/基线）：首次使用与已确认
+    布局都列出关键字段取自哪张表、哪一行表头、哪一列，含次表头（双行
+    表头）取值说明，使数量/单价/重量来源可追溯。"""
+    lines: list[str] = []
+    for role, table in _semantic_tables(layout).items():
+        columns = table.get("columns") or {}
+        if not isinstance(columns, dict) or not columns:
+            continue
+        parts = [f"{_FIELD_LABELS.get(name, name)}→{col}"
+                 for name, col in columns.items()]
+        text = f"{_role_label(role)}（工作表 {table.get('sheet')}）：" \
+               f"表头第{table.get('header_row')}行；" + "、".join(parts)
+        sub = table.get("subheader_row")
+        if sub:
+            text += f"；单件重/总净重取自第{sub}行次表头"
+        supp = table.get("supplementary") or {}
+        if isinstance(supp, dict) and supp.get("hs_code"):
+            text += f"；补充HS列→{supp['hs_code']}"
+        lines.append(text)
+    return lines
+
+
+def _diff_layout_structure(baseline: dict, current: dict) -> list[str]:
+    """对比当前布局与已确认基准布局，列出结构变化（不含数值/正文）。
+
+    表按语义角色配对（parts_invoice↔parts_invoice、machine_table#0↔
+    machine_table#0……），不按 sheet 名配对：sheet 重命名体现为
+    “工作表 X→Y”，角色缺失/新增体现为“新增/移除表”；
+    只报告字段定位差异（sheet、表头行、列位），供成功邮件提示人工重点核对。
+    """
+    changes: list[str] = []
+    FIELD_LABELS = {
+        "part_code": "料号", "qty": "数量", "unit_price": "单价",
+        "unit_weight": "单件重", "net_weight": "总净重", "coo": "原产国",
+        "hs_code_titled": "表头HS编码", "hs_code": "商品编码",
+        "product_name": "商品名称", "spec": "规格型号",
+        "packages": "件数", "gross_weight": "毛重",
+        "model": "机型", "mso": "MSO", "serial": "序列号",
+        "pin": "PIN", "engine": "发动机号",
+        "description": "描述", "net": "净重", "gross": "毛重(箱单)",
+    }
+
+    def diff_table(name: str, base: dict, cur: dict) -> None:
+        if base.get("sheet") != cur.get("sheet"):
+            changes.append(f"{name}：工作表 {base.get('sheet')}→{cur.get('sheet')}（重命名/换表）")
+        for row_key, label in (("header_row", "表头行"), ("subheader_row", "次表头行"),
+                               ("total_row", "TOTAL行"),
+                               ("data_first_row", "数据起始行"), ("data_last_row", "数据结束行")):
+            b, c = base.get(row_key), cur.get(row_key)
+            if b is not None and c is not None and b != c:
+                changes.append(f"{name}：{label} {b}→{c}")
+        base_cols = dict(base.get("columns") or {})
+        cur_cols = dict(cur.get("columns") or {})
+        for field in sorted(set(base_cols) | set(cur_cols)):
+            b, c = base_cols.get(field), cur_cols.get(field)
+            label = FIELD_LABELS.get(field, field)
+            if b != c:
+                changes.append(f"{name}·{label}：{b or '无'}→{c or '无'}")
+        base_supp = dict(base.get("supplementary") or {})
+        cur_supp = dict(cur.get("supplementary") or {})
+        for field in sorted(set(base_supp) | set(cur_supp)):
+            b, c = base_supp.get(field), cur_supp.get(field)
+            label = FIELD_LABELS.get(field, field)
+            if b != c:
+                changes.append(f"{name}·补充列{label}：{b or '无'}→{c or '无'}")
+
+    base_roles = _semantic_tables(baseline or {})
+    cur_roles = _semantic_tables(current or {})
+    for role in sorted(set(base_roles) | set(cur_roles)):
+        label = _role_label(role)
+        base, cur = base_roles.get(role), cur_roles.get(role)
+        if base is None:
+            changes.append(f"新增{label}（工作表 {cur.get('sheet')}）")
+        elif cur is None:
+            changes.append(f"移除{label}（原工作表 {base.get('sheet')}）")
+        else:
+            diff_table(label, base, cur)
+    # 去重保序
+    seen: set[str] = set()
+    unique = []
+    for item in changes:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
 class AppService:
     def __init__(
         self,
@@ -259,6 +391,12 @@ class AppService:
                 (task_id,),
             )
         ]
+        layout = self.tasks.layout(task_id, selected_version)
+        layout_confirmed = False
+        if layout and layout.get("fingerprint"):
+            layout_confirmed = bool(self.tasks.find_confirmed_layout(
+                str(layout.get("kind") or task.get("kind") or ""),
+                str(layout.get("fingerprint"))))
         return {
             "task": task,
             "version": selected_version,
@@ -271,6 +409,8 @@ class AppService:
             "mails": self.mail_store.for_task(task_id),
             "inputs": self.tasks.inputs(task_id, selected_version),
             "overrides": self.tasks.overrides(task_id),
+            "layout": layout,
+            "layout_confirmed": layout_confirmed,
         }
 
     def health(self) -> dict[str, Any]:
@@ -750,6 +890,7 @@ class AppService:
 
         self.tasks.set_kind(task_id, str(response["kind"]), actor=actor)
         task = self.tasks.require(task_id)
+        layout = response.get("layout") or {}
         self.tasks.update_result(
             task_id,
             version,
@@ -759,7 +900,36 @@ class AppService:
             output_dir=str(output_dir),
             status=state.PROCESSING,
             record_count=len(response["records"]),
+            layout=layout or None,
         )
+        if layout:
+            fingerprint = str(layout.get("fingerprint") or "")
+            confirmed = bool(
+                fingerprint
+                and self.tasks.find_confirmed_layout(str(response["kind"]), fingerprint)
+            )
+            # 仅记录结构指纹、采用工作表与规则ID；不记录正文或秘密。
+            self.tasks.add_event(
+                task_id,
+                stage="validation",
+                code="layout_seen",
+                actor=actor,
+                detail={
+                    "kind": response["kind"],
+                    "fingerprint": fingerprint,
+                    "confirmed_layout": confirmed,
+                    "sheets": layout.get("sheets") or [],
+                    "checks": [c.get("rule") for c in layout.get("checks", []) if isinstance(c, dict)],
+                },
+            )
+            self.logger.info(
+                "task_layout_seen",
+                task_id=task_id,
+                version=version,
+                kind=response["kind"],
+                fingerprint=fingerprint,
+                confirmed_layout=confirmed,
+            )
         self.tasks.replace_issues(task_id, version, response["issues"])
         self.tasks.replace_provenance(task_id, version, response["provenance"])
         self.tasks.clear_artifacts(task_id, version)
@@ -977,12 +1147,14 @@ class AppService:
             self.logger.info("task_regenerated_only", task_id=task_id, version=version)
             return fresh
         artifacts = self.tasks.artifacts(task_id, version)
+        layout_report = self._layout_report(fresh, response, request)
         try:
             delivery_row, _ = self.delivery.enqueue_delivery(
                 fresh,
                 record_count=len(response["records"]),
                 artifacts=artifacts,
                 content_hash=content_hash,
+                layout_report=layout_report,
             )
         except Exception as exc:
             self.tasks.add_event(
@@ -1197,6 +1369,10 @@ class AppService:
             "output_dir": str(output_dir),
             "overrides": overrides,
         }
+        # 表头别名随请求快照持久化：同版本重试不依赖当前配置状态；
+        # 别名是解析配置而非秘密，进入版本快照便于追溯。
+        if self.config.core.header_aliases:
+            request["header_aliases"] = self.config.core.header_aliases
         request_path = version_dir / "request.json"
         temporary = request_path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1261,6 +1437,88 @@ class AppService:
             raise StateTransitionError("Only RETRY_PENDING or FAILED tasks can be retried")
         self.tasks.reset_retry_budget(task_id)
         return self.process_task(task_id, actor=actor)
+
+    # ------------------------------------------------------------------
+    # 表格布局确认（显式人工动作；基准为已确认布局）
+    # ------------------------------------------------------------------
+    def _layout_report(self, task: dict[str, Any], response: dict,
+                       request: dict | None) -> dict | None:
+        """汇总回复正文用的布局信息：采用 sheet、结构变化、已执行核对。
+
+        首次使用（未确认）的布局给出人工重点核对建议；已确认布局不重复
+        告警。结构变化与实际修正分别列出。不替代暂停：阻塞问题仍走追问。
+        """
+        layout = (response or {}).get("layout") or {}
+        if not layout:
+            return None
+        kind = str(response.get("kind") or task.get("kind") or "")
+        fingerprint = str(layout.get("fingerprint") or "")
+        confirmed = bool(
+            fingerprint and self.tasks.find_confirmed_layout(kind, fingerprint)
+        )
+        report: dict[str, Any] = {
+            "kind": kind,
+            "fingerprint": fingerprint,
+            "confirmed": confirmed,
+            "first_use": not confirmed,
+            "sheets": layout.get("sheets") or [],
+            "structure_changes": [],
+            "checks": [c for c in (layout.get("checks") or []) if isinstance(c, dict)],
+        }
+        baseline_row = self.tasks.latest_confirmed_layout(kind)
+        if baseline_row and not confirmed:
+            try:
+                baseline = json.loads(baseline_row["structure_json"])
+            except (TypeError, json.JSONDecodeError):
+                baseline = {}
+            report["structure_changes"] = _diff_layout_structure(
+                baseline, layout)
+        corrections = []
+        for item in (request or {}).get("overrides") or []:
+            key = item.get("record_key")
+            field = item.get("field")
+            if key and field:
+                corrections.append(f"{key}.{field}={item.get('value')}")
+        # 自动窄规范化（如规格型号 1|| → 1|）：与实际值、来源一并列出，
+        # 不得只报告按回复执行的修正（自动修正在交付正文同样可见）。
+        automatic = [c for c in (layout.get("corrections") or [])
+                     if isinstance(c, dict) and c.get("summary")]
+        report["corrections"] = (
+            [str(c["summary"]) for c in automatic] + corrections
+        )
+        report["corrections_auto"] = bool(automatic)
+        report["table_columns"] = _table_column_lines(layout)
+        return report
+
+    def confirm_layout(self, task_id: str, *, actor: str,
+                       version: int | None = None) -> dict[str, Any]:
+        """把任务某版本采用的布局显式确认为该类业务的基准布局。"""
+        task = self.tasks.require(task_id)
+        version = int(version or task["version"])
+        layout = self.tasks.layout(task_id, version)
+        if not layout:
+            raise ValidationError(
+                f"Task {task_id} v{version} has no stored layout to confirm")
+        kind = str(layout.get("kind") or task.get("kind") or "")
+        fingerprint = str(layout.get("fingerprint") or "")
+        if not kind or not fingerprint:
+            raise ValidationError("Stored layout is missing kind/fingerprint")
+        row = self.tasks.confirm_layout(
+            kind, fingerprint,
+            {k: layout.get(k) for k in
+             ("sheets", "structure", "parts_invoice", "packing_total",
+              "machine_table", "weight_table", "checks")},
+            actor=actor,
+        )
+        self.tasks.add_event(
+            task_id,
+            stage="admin",
+            code="layout_confirmed",
+            actor=actor,
+            detail={"kind": kind, "fingerprint": fingerprint, "version": version},
+        )
+        return {"kind": kind, "fingerprint": fingerprint,
+                "confirmed_at": row["confirmed_at"], "version": version}
 
     def reprocess_task(
         self, task_id: str, *, actor: str = "admin", regenerate_only: bool = False
@@ -1332,11 +1590,17 @@ class AppService:
         if not artifacts:
             raise ValidationError("The current task version has no output artifacts")
         version_row = self.tasks.get_version(task_id, version) or {}
+        stored_layout = self.tasks.layout(task_id, version)
+        layout_report = None
+        if stored_layout:
+            layout_report = self._layout_report(
+                task, {"kind": task.get("kind"), "layout": stored_layout}, None)
         row, _ = self.delivery.enqueue_delivery(
             task,
             record_count=int(version_row.get("record_count") or 0),
             artifacts=artifacts,
             content_hash=task.get("content_hash"),
+            layout_report=layout_report,
         )
         self._dispatch_if_pending(row, actor=actor)
         self.tasks.add_event(
@@ -1867,7 +2131,7 @@ class AppService:
                 )
                 total = 0
                 for attachment in parsed.attachments:
-                    if attachment.suffix not in {"xlsx", "xlsm"}:
+                    if str(attachment.suffix).lower() not in {"xlsx", "xls", "xlsm"}:
                         continue
                     total += attachment.size
                     if total > self.config.mail.max_total_attachment_bytes:
@@ -1878,18 +2142,24 @@ class AppService:
                         {
                             "data": attachment.data,
                             "filename": attachment.filename,
-                            "mime_type": XLSX_MIME,
+                            "mime_type": (
+                                "application/vnd.ms-excel"
+                                if str(attachment.suffix).lower() == "xls"
+                                else XLSX_MIME
+                            ),
                             "source_type": "offline_attachment",
                         }
                     )
                 continue
-            if suffix not in {"xlsx", "xlsm"}:
+            if suffix not in {"xlsx", "xls", "xlsm"}:
                 raise ValidationError(f"Unsupported offline source type: {path.name}")
             expanded.append(
                 {
                     "data": path.read_bytes(),
                     "filename": safe_filename(path.name),
-                    "mime_type": XLSX_MIME,
+                    "mime_type": (
+                        "application/vnd.ms-excel" if suffix == "xls" else XLSX_MIME
+                    ),
                     "source_type": "offline_source",
                 }
             )

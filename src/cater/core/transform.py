@@ -47,8 +47,14 @@ def build_parts_rows(records, country_index, destination: Optional[dict],
                      gross_weight, packages, invoice_no,
                      gross_source, packages_source, invoice_source,
                      issues: list) -> tuple:
-    """返回 (rows, json_records, provenance)。destination = {name, alpha3} 或 None。"""
-    rows, json_records, provenance = [], [], []
+    """返回 (rows, json_records, provenance, normalizations)。
+
+    destination = {name, alpha3} 或 None。normalizations 记录自动窄规范化
+    （如规格型号开头 ``1||`` → ``1|`` 删除多余空项）：含记录键、字段、
+    前后完整值（保留内部竖线）、来源与可读摘要，供交付正文“实际修正”节
+    与人工审计使用——自动修正必须与按回复执行的修正一并可见。
+    """
+    rows, json_records, provenance, normalizations = [], [], [], []
     if gross_weight is None:
         issues.append(Issue(
             code="MISSING_FIELD", field="gross_weight",
@@ -126,7 +132,22 @@ def build_parts_rows(records, country_index, destination: Optional[dict],
         row["destination"] = dest_alpha3 or ""
         row["hs_code"] = str(f["hs_code"].value)
         row["product_name"] = str(f["product_name"].value)
-        row["spec"] = clean_spec(str(f["spec"].value))
+        row["spec_raw"] = str(f["spec"].value)
+        row["spec"] = clean_spec(row["spec_raw"])
+        if row["spec"] != row["spec_raw"]:
+            spec_src = f["spec"].source
+            loc = ""
+            if spec_src is not None and spec_src.sheet and spec_src.cell:
+                loc = f"（{spec_src.sheet}!{spec_src.cell}）"
+            normalizations.append({
+                "record_key": rec.part_code, "field": "spec",
+                "before": row["spec_raw"], "after": row["spec"],
+                "summary": f"料号 {rec.part_code} 规格型号自动规范化"
+                           f"（删除开头多余空项）：{row['spec_raw']} → "
+                           f"{row['spec']}{loc}",
+                "source": spec_src.to_dict() if spec_src is not None else None,
+            })
+        del row["spec_raw"]
         row["order_no"] = ""  # 已确认本期留空，禁止复制旧值
         if idx == 0:
             # 已确认三个输出值仅首条填写
@@ -161,7 +182,7 @@ def build_parts_rows(records, country_index, destination: Optional[dict],
             "fields": {k: (None if fv.value is None else str(fv.value)) for k, fv in f.items()},
             "row": row,
         })
-    return rows, json_records, provenance
+    return rows, json_records, provenance, normalizations
 
 
 def build_machine_rows(records, machine_index, destination: Optional[dict],

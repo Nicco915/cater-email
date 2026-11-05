@@ -54,6 +54,105 @@ FIELD_LABELS = {
     "total_sales_price": "机器销售价格", "net_weight": "净重", "qty": "数量",
     "part_code": "商品料号", "coo": "原产国", "destination": "目的国",
     "unit_price": "单价", "hs_code": "商品编码",
+    "unit_weight": "单件重", "packages": "件数", "gross_weight": "毛重",
+    "hs_code_titled": "表头HS", "description": "品名", "gross": "毛重",
+}
+
+
+def _humanize_detail(message: str) -> str:
+    """把问题消息里的 Python 字面量换成可读中文（不泄露内部结构）。
+
+    - ``['coo', 'qty']`` → ``原产国、数量``（字段走 FIELD_LABELS，其余按原文）；
+    - ``[('qty', [6, 10])]`` → ``数量（第6、10列均命中，无法唯一确定）``；
+    - ``行[17, 24]`` → ``第17、24``；``[]`` → ``无``。
+    """
+    import re
+    text = str(message or "")
+    if not text:
+        return ""
+    text = re.sub(r"\[\s*\]", "无", text)
+
+    def _ambiguous(m: "re.Match[str]") -> str:
+        field = m.group(1)
+        cols = "、".join(n.strip() for n in m.group(2).split(",") if n.strip())
+        return f"{FIELD_LABELS.get(field, field)}（第{cols}列均命中，无法唯一确定）"
+
+    text = re.sub(r"\('([a-z_]+)',\s*\[([0-9,\s]+)\]\)", _ambiguous, text)
+
+    def _quoted_list(m: "re.Match[str]") -> str:
+        items = [i.strip() for i in re.findall(r"'([^']*)'", m.group(0))]
+        return "、".join(
+            FIELD_LABELS.get(item, item) if re.fullmatch(r"[a-z_]+", item) else item
+            for item in items)
+
+    text = re.sub(r"\[((?:\s*'[^']+'\s*,?)+)\]", _quoted_list, text)
+    text = re.sub(r"\[([0-9][0-9,\s]*)\]",
+                  lambda m: "第" + "、".join(
+                      n.strip() for n in m.group(1).split(",") if n.strip()),
+                  text)
+    # 元组列表替换后残留的外层方括号（含中文内容）收尾去掉
+    text = re.sub(r"\[([^\[\]]*[一-鿿][^\[\]]*)\]", r"\1", text)
+    text = re.sub(
+        r"\b(part_code|unit_price|net_weight|unit_weight|hs_code_titled|"
+        r"hs_code|qty|coo|model|serial|packages|gross_weight)\b",
+        lambda m: FIELD_LABELS.get(m.group(1), m.group(1)), text)
+    return (text.replace("=无", "：无").replace("=None", "为空")
+            .replace("行第", "第").replace("（ambiguous）", "（存在多候选）")
+            .replace("（incomplete）", "（缺少必需列）")
+            .replace("（second_header）", "（出现重复表头行）")
+            .replace("（multiple_totals）", "（多张合计行）").strip())
+
+
+def _source_location(issue: dict) -> str:
+    """首个来源的工作表/单元格定位（面向用户的简短位置描述）。"""
+    for src in issue.get("sources") or []:
+        if not isinstance(src, dict):
+            continue
+        sheet, cell = src.get("sheet"), src.get("cell")
+        if sheet and cell:
+            return f"（{sheet} 表 {cell}）"
+        if sheet:
+            return f"（{sheet} 表）"
+        if src.get("filename"):
+            return f"（附件 {src['filename']}）"
+    return ""
+
+
+# 输入结构类问题（附件表头/表块/合计行/明细行）的可读引导：这些是
+# 客户工作簿的结构问题，不是机型资料库问题，必须给出工作表/单元格
+# 定位、实际缺失/多候选字段与可执行的补充动作，禁止笼统“联系处理人员”。
+_STRUCTURE_GUIDANCE = {
+    "INVALID_DETAIL_ROW": ("最终发票明细行的必填数值缺失或不是有效数字，该行未纳入输出",
+                           "请补齐该行数量/单价后，将修正后的 Excel 附件直接回复本邮件"),
+    "FINAL_SHEET_INVALID": ("最终发票表结构不完整或不唯一，不能自动替代或猜测",
+                            "请补齐表头（料号/数量/单价/原产国/重量）与表头右侧三列"
+                            "补充资料（商品编码/中文名/申报要素）后重发附件"),
+    "AMBIGUOUS_FINAL_SHEET": ("存在多张合格的最终发票表，无法唯一选定",
+                              "请仅保留一张最终业务表（删除或移出其余工作表）后重发附件"),
+    "FINAL_SHEET_NOT_FOUND": ("未找到含补充资料列的最终调整表（如 CI-For Dealer (2)），"
+                              "原表不能自动替代",
+                              "请提供含补充资料（表头右侧三列）的最终调整表 Excel 附件"),
+    "SUPPLEMENTARY_COLUMNS_INVALID": ("最终调整表右侧三列补充资料"
+                                      "（商品编码/中文名/申报要素）不完整",
+                                      "请确认三列依次填写（商品编码为 8–13 位数字）后重发附件"),
+    "PACKING_TOTALS_INVALID": ("箱单的件数/毛重合计列无法唯一定位",
+                               "请确认箱单表头只保留一份 PACKAGE 与 GROSS WEIGHT 列"
+                               "后重发附件"),
+    "MULTIPLE_TOTAL_ROWS": ("同一张表块内出现多张合计（TOTAL）行，无法确定以哪一行为准",
+                            "请仅保留本票唯一一张 TOTAL 行（其余合计行移出该表块）后重发附件"),
+    "MACHINE_TABLE_INVALID": ("机器信息表结构不完整、表头不唯一或存在多张表块",
+                              "请只保留一张连续的机器信息表（表头含 MODEL/MSO# 等，"
+                              "各表块用空行分隔）后重发附件"),
+    "AMBIGUOUS_MACHINE_TABLE": ("多张工作表都存在机器信息表，无法唯一选定",
+                                "请删除多余工作表或明确本票使用的机器信息表后重发附件"),
+    "WEIGHT_TABLE_INVALID": ("箱单重量表结构不完整或表头不唯一",
+                             "请补齐重量表表头（DESCRIPTION/QTY/NET WEIGHT 等）"
+                             "并保证唯一后重发附件"),
+    "AMBIGUOUS_WEIGHT_TABLE": ("多张工作表都存在箱单重量表，无法唯一选定",
+                               "请删除多余工作表或明确本票使用的箱单重量表后重发附件"),
+    "MISSING_SOURCE": ("未收到所需的 Excel 附件", None),
+    "UNSUPPORTED_FILE": ("附件无法使用（不是有效的 xlsx/xls、文件已加密，"
+                         "或不含所需工作表）", None),
 }
 _QUIET_SUBJECT_RE = None
 
@@ -161,6 +260,18 @@ class DeliveryService:
             elif code == "REPROCESS_CONFIRMATION_REQUIRED":
                 lines.append("- 这票货物之前处理过，本次资料有变化，请确认是否重新处理。")
                 examples.append("确认重新处理")
+            elif code in _STRUCTURE_GUIDANCE:
+                head, default_action = _STRUCTURE_GUIDANCE[code]
+                if record and code == "INVALID_DETAIL_ROW":
+                    head = (f"编号 {record}：" + head.replace(
+                        "最终发票明细行", "所在明细行"))
+                lines.append(f"- {head}{_source_location(issue)}。")
+                detail = _humanize_detail(issue.get("message"))
+                if detail:
+                    lines.append(f"  具体情况：{detail}")
+                action = issue.get("required_action") or default_action
+                if action:
+                    lines.append(f"  {action}")
             elif code == "MISSING_FIELD" or code.startswith("MISSING_"):
                 fields = [item.strip() for item in field.split(",") if item.strip()]
                 names = "、".join(FIELD_LABELS.get(item, "业务信息") for item in fields) or "业务信息"
@@ -169,6 +280,8 @@ class DeliveryService:
                     for name in fields:
                         value = "4" if name == "qty" else "请填写正确值"
                         examples.append(f"修正：{record}.{name}={value}")
+                elif issue.get("required_action"):
+                    lines.append(f"  {issue['required_action']}")
                 else:
                     lines.append("  请联系处理人员核对该项资料，再按提示补充。")
             elif code == "FIELD_CONFLICT":
@@ -645,6 +758,7 @@ class DeliveryService:
         *,
         record_count: int,
         artifacts: list[dict[str, Any]],
+        layout_report: dict[str, Any] | None = None,
     ) -> str:
         marker = task_marker(str(task["id"]), int(task["version"]))
         lines = [
@@ -661,6 +775,7 @@ class DeliveryService:
         ]
         for artifact in artifacts:
             lines.append(f"- {artifact['filename']}")
+        lines.extend(self._layout_lines(layout_report))
         lines.extend(
             [
                 "",
@@ -671,6 +786,55 @@ class DeliveryService:
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _layout_lines(layout_report: dict[str, Any] | None) -> list[str]:
+        """布局与核对信息：采用 sheet、结构变化、已执行核对、人工建议。
+
+        结构变化与实际修正分别列出；首次使用新布局重点提示，已确认
+        布局不重复告警；普通成功保持简短。核对未执行不称通过。
+        """
+        if not layout_report:
+            return []
+        lines: list[str] = []
+        sheets = layout_report.get("sheets") or []
+        if sheets:
+            lines.append(f"采用工作表：{'、'.join(str(s) for s in sheets)}")
+        table_columns = layout_report.get("table_columns") or []
+        if table_columns:
+            lines.append("字段列位（本版采用）：")
+            lines.extend(f"- {item}" for item in table_columns)
+        changes = layout_report.get("structure_changes") or []
+        if changes:
+            lines.append("结构变化（相对已确认布局）：")
+            lines.extend(f"- {item}" for item in changes)
+        checks = layout_report.get("checks") or []
+        if checks:
+            lines.append("已执行核对：")
+            for check in checks:
+                if check.get("result") == "pass":
+                    mark = "通过"
+                elif check.get("result") == "skipped":
+                    mark = "未执行（条件不足，跳过）"
+                else:
+                    mark = "未通过"
+                record = check.get("record_key")
+                prefix = f"{record} " if record else ""
+                lines.append(f"- {prefix}{mark}：{check.get('detail', '')}")
+        corrections = layout_report.get("corrections") or []
+        if corrections:
+            if layout_report.get("corrections_auto"):
+                lines.append("实际修正（自动规范化与按您回复的修正项）：")
+            else:
+                lines.append("实际修正（按您回复的修正项执行）：")
+            lines.extend(f"- {item}" for item in corrections)
+        if layout_report.get("first_use"):
+            lines.append(
+                "人工重点核对建议：本次表格布局为首次使用（尚未确认），"
+                "请重点核对附件中的数量、净重、单价与原始发票/箱单一致后再上传业务系统；"
+                "确认无误后可联系维护人员确认该布局，以后不再重复提示。"
+            )
+        return lines
+
     def enqueue_delivery(
         self,
         task: dict[str, Any],
@@ -678,6 +842,7 @@ class DeliveryService:
         record_count: int,
         artifacts: list[dict[str, Any]],
         content_hash: str | None,
+        layout_report: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         if not artifacts:
             raise ValueError("A delivery requires at least one artifact")
@@ -704,7 +869,8 @@ class DeliveryService:
         recipient = self._recipient(task)
         in_reply_to, references = self._thread_headers(task)
         subject = outbound_subject(self._original_subject(task), str(task["id"]), int(task["version"]))
-        body = self.delivery_body(task, record_count=record_count, artifacts=artifacts)
+        body = self.delivery_body(task, record_count=record_count, artifacts=artifacts,
+                                  layout_report=layout_report)
         dry_run = not self._live_allowed(recipient)
         row, created = self.outbox.enqueue(
             dedupe_key=dedupe_key,

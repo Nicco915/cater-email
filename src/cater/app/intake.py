@@ -47,6 +47,20 @@ XLSX_CONTENT_TYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/xlsx",
 }
+XLS_CONTENT_TYPES = {
+    "application/vnd.ms-excel",
+    "application/x-xls",
+    "application/msexcel",
+}
+WORKBOOK_SUFFIXES = {"xlsx", "xls"}
+
+
+def _is_workbook_attachment(item: ParsedAttachment) -> bool:
+    """按扩展名或 MIME 识别可解析工作簿（xlsx 与真正 BIFF xls）。"""
+    if str(item.suffix).lower() in WORKBOOK_SUFFIXES:
+        return True
+    content_type = str(item.content_type or "").lower()
+    return content_type in XLSX_CONTENT_TYPES or content_type in XLS_CONTENT_TYPES
 
 
 @dataclass
@@ -312,7 +326,7 @@ class IntakeService:
                     "field": None,
                     "message": "An attachment could not be stored safely.",
                     "sources": [],
-                    "required_action": "Resend the xlsx attachment.",
+                    "required_action": "Resend the xlsx or xls attachment.",
                 }
             )
 
@@ -675,7 +689,7 @@ class IntakeService:
                     "field": "attachment",
                     "message": "补件附件无法安全保存，本次未自动重新处理。",
                     "sources": [{"kind": "mail", "mail_id": mail["id"]}],
-                    "required_action": "请重新发送 xlsx 附件。",
+                    "required_action": "请重新发送 xlsx 或 xls 附件。",
                 },
             )
             return IngestResult(
@@ -969,7 +983,7 @@ class IntakeService:
         for item in parsed.attachments:
             if item.is_inline:
                 continue
-            if item.suffix != "xlsx" and item.content_type not in XLSX_CONTENT_TYPES:
+            if not _is_workbook_attachment(item):
                 continue
             if item.size > self.config.mail.max_attachment_bytes:
                 continue
@@ -1099,7 +1113,7 @@ class IntakeService:
                     "field": "attachment",
                     "message": "、".join(group[0].filename for group in groups.values()),
                     "sources": [],
-                    "required_action": "补件附件暂时无法安全保存，本次未作任何改动；请重新发送 xlsx 附件。",
+                    "required_action": "补件附件暂时无法安全保存，本次未作任何改动；请重新发送 xlsx 或 xls 附件。",
                 },
                 [],
                 set(),
@@ -1128,7 +1142,7 @@ class IntakeService:
                     "field": "attachment",
                     "message": "One or more attachments exceed the per-file size limit.",
                     "sources": [],
-                    "required_action": "Resend a smaller xlsx attachment.",
+                    "required_action": "Resend a smaller xlsx or xls attachment.",
                 }
             )
         if total > self.config.mail.max_total_attachment_bytes:
@@ -1139,27 +1153,23 @@ class IntakeService:
                     "field": "attachment",
                     "message": "Attachments exceed the total size limit.",
                     "sources": [],
-                    "required_action": "Resend only the required xlsx attachment.",
+                    "required_action": "Resend only the required xlsx or xls attachment.",
                 }
             )
         for item in non_inline:
-            suffix = item.suffix
-            is_xlsx_type = item.content_type in {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "application/xlsx",
-            }
-            if suffix != "xlsx" and not is_xlsx_type:
+            if not _is_workbook_attachment(item):
                 issues.append(
                     {
                         "code": "UNSUPPORTED_ATTACHMENT",
                         "record_key": None,
                         "field": "attachment",
                         "message": (
-                            f"Attachment '{item.filename}' is not a supported xlsx workbook. "
-                            "Images, PDFs, xls, encrypted or password-protected files are not guessed."
+                            f"Attachment '{item.filename}' is not a supported workbook "
+                            "(xlsx or xls). Images, PDFs, encrypted or password-protected "
+                            "files are not guessed."
                         ),
                         "sources": [],
-                        "required_action": "Resend the data as an unencrypted xlsx attachment.",
+                        "required_action": "Resend the data as an unencrypted xlsx or xls attachment.",
                     }
                 )
         if any("attachment_too_large" in warning for warning in parsed.parse_warnings):
@@ -1171,7 +1181,7 @@ class IntakeService:
                         "field": "attachment",
                         "message": "An attachment was truncated because it exceeds its size limit.",
                         "sources": [],
-                        "required_action": "Resend a smaller xlsx attachment.",
+                        "required_action": "Resend a smaller xlsx or xls attachment.",
                     }
                 )
         return issues
@@ -1188,12 +1198,7 @@ class IntakeService:
         for item in attachments:
             if item.is_inline:
                 continue
-            suffix = item.suffix
-            is_xlsx_type = item.content_type in {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "application/xlsx",
-            }
-            if suffix != "xlsx" and not is_xlsx_type:
+            if not _is_workbook_attachment(item):
                 continue
             if item.size > self.config.mail.max_attachment_bytes:
                 continue

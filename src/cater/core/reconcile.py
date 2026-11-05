@@ -65,6 +65,12 @@ def _price_equal(a: Decimal, b: Decimal) -> bool:
     return abs(a - b) <= max(abs(a), abs(b)) * Decimal("1e-9")
 
 
+def _plain_decimal(d: Decimal) -> Decimal:
+    """去掉浮点来源的多余尾零（17300.0→17300），不引入舍入。"""
+    quantized = d.quantize(Decimal("0.00001"))
+    return Decimal(format(quantized.normalize(), "f"))
+
+
 def _model_key(text) -> str:
     return " ".join(str(text).replace("\xa0", " ").split()).upper()
 
@@ -231,7 +237,7 @@ def reconcile_machines(mail_rows: list, invoice_rows: list, packing_rows: list,
             ))
             continue
         rec.fields["net_weight"] = FieldValue(
-            f"{group.net_weight}/{group.qty}", per,
+            f"{group.net_weight}/{group.qty}", _plain_decimal(per),
             Source(type="computed", filename=group.source.filename,
                    sheet=group.source.sheet, cell=group.source.cell,
                    detail=f"箱单组净重{group.net_weight}÷数量{group.qty}"))

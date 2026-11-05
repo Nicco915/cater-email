@@ -421,6 +421,15 @@ def cmd_confirm_reprocess(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_confirm_layout(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        result = service.confirm_layout(
+            args.task_id, actor="cli", version=args.version)
+    print(f"{result['kind']} layout {result['fingerprint']} confirmed "
+          f"(task {args.task_id} v{result['version']})")
+    return 0
+
+
 def cmd_deliver(args: argparse.Namespace) -> int:
     with _service(args) as service:
         task = service.deliver_task(args.task_id, actor="cli")
@@ -719,6 +728,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = command("confirm-reprocess", cmd_confirm_reprocess, "Confirm a required reprocess")
     p.add_argument("task_id")
+
+    p = command("confirm-layout", cmd_confirm_layout,
+                "Confirm the layout used by a task version as the baseline")
+    p.add_argument("task_id")
+    p.add_argument("--version", type=int, default=None)
 
     p = command("deliver", cmd_deliver, "Create and dispatch delivery for a READY_TO_SEND task")
     p.add_argument("task_id")
