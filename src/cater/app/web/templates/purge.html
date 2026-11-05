@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}永久清理 · {{ task_id }} · CATER{% endblock %}
+{% block content %}
+<h1>永久清理任务文件</h1>
+<p class="muted mono">{{ task_id }} · 状态 {{ purge.status }}</p>
+
+<section class="panel">
+  <h2>将删除的文件（{{ purge.file_count }}）</h2>
+  {% if purge.files %}
+  <ul class="files">
+    {% for f in purge.files %}
+    <li class="mono">{{ f.path }} <span class="muted">({{ f.size }} 字节)</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">没有可清理的任务目录文件。</p>
+  {% endif %}
+
+  <h2>保留（不可恢复的摘要）</h2>
+  <ul>
+    {% for item in purge.kept %}<li>{{ item }}</li>{% endfor %}
+  </ul>
+  <p class="warn">{{ purge.note }}</p>
+
+  <form method="post" action="/tasks/{{ task_id }}/purge" class="stack">
+    {% include "_csrf.html" %}
+    <label class="checkall"><input type="checkbox" name="confirm" value="1"> 我确认永久删除上述任务文件，且明白原始附件无法恢复</label>
+    <button type="submit" class="danger">确认永久清理</button>
+  </form>
+  <p><a class="button" href="/tasks/{{ task_id }}">返回任务</a></p>
+</section>
+{% endblock %}

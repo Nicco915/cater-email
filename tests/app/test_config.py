@@ -109,8 +109,18 @@ def test_runtime_settings_are_audited_and_cache_invalidated(service) -> None:
     audit = service.settings.audit(limit=20)
     keys = {item["key"] for item in audit}
     assert {"sending.dry_run", "sending.enabled", "scan.poll_interval_seconds"} <= keys
-    assert all(item["actor"] == "test-admin" for item in audit)
-    assert all(item["reason"] == "unit-test" for item in audit)
+    # The settings rows the test just wrote carry this actor/reason. Other
+    # audit rows (for example the one-time, system-actor reference seed that
+    # marks the database authoritative) are intentionally present too.
+    settings_rows = [
+        item
+        for item in audit
+        if item["key"]
+        in {"sending.dry_run", "sending.enabled", "scan.poll_interval_seconds"}
+    ]
+    assert settings_rows
+    assert all(item["actor"] == "test-admin" for item in settings_rows)
+    assert all(item["reason"] == "unit-test" for item in settings_rows)
     # Audit payloads contain configuration values, never credentials.
     serialized = json.dumps(audit, ensure_ascii=False)
     assert "password" not in serialized.lower()

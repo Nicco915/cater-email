@@ -89,6 +89,13 @@ GUIDANCE_NOT_OWNER = (
     "如有疑问，请联系维护人员。"
 )
 
+GUIDANCE_DELETED_TASK = (
+    "您好：\n\n"
+    "您回复的任务已从列表删除并进入回收站，本次未执行重新处理、重试或资料补充，也没有发送任何结果。\n"
+    "如需恢复该任务，请联系维护人员从回收站恢复后再操作；恢复本身不会自动重发或重新生成。\n"
+    "查询状态请单独写：查询状态。"
+)
+
 
 def _mail_fingerprint(mail: dict[str, Any]) -> str:
     return str(mail.get("raw_hash") or mail.get("message_id") or mail["id"])
@@ -361,6 +368,20 @@ class IntakeService:
             return result
         self.mail_store.set_task(str(mail["id"]), str(task["id"]))
         version = int(task["version"])
+        # A trashed (recycle-bin) task is frozen: data supplements and
+        # reprocess/retry commands are refused. A status query is the only
+        # command still answered, and it only tells the owner the task was
+        # deleted and can be recovered by maintenance — no other task is leaked.
+        if task.get("deleted_at") is not None:
+            if supplement.has_command and supplement.commands[0] == "status":
+                return self._handle_command(mail, parsed, supplement, task, version)
+            result = self._filter(
+                mail,
+                "task_deleted",
+                task_id=str(task["id"]),
+            )
+            result.guidance = GUIDANCE_DELETED_TASK
+            return result
         self.logger.info(
             "supplement_received",
             mail_id=mail["id"],

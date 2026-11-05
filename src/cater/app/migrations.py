@@ -417,6 +417,67 @@ CREATE INDEX IF NOT EXISTS idx_outbox_message_id_status ON outbox(message_id, st
 """
 
 
+MIGRATION_8 = """
+ALTER TABLE tasks ADD COLUMN archived_at TEXT;
+ALTER TABLE tasks ADD COLUMN deleted_at TEXT;
+ALTER TABLE tasks ADD COLUMN deletion_reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_lifecycle ON tasks(archived_at, deleted_at);
+
+ALTER TABLE countries ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE countries ADD COLUMN disabled_at TEXT;
+ALTER TABLE countries ADD COLUMN disabled_reason TEXT;
+
+ALTER TABLE country_aliases ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE machine_materials ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE machine_materials ADD COLUMN disabled_at TEXT;
+ALTER TABLE machine_materials ADD COLUMN disabled_reason TEXT;
+
+ALTER TABLE machine_aliases ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+
+CREATE INDEX IF NOT EXISTS idx_countries_enabled ON countries(enabled);
+CREATE INDEX IF NOT EXISTS idx_machines_enabled
+    ON machine_materials(model_norm, destination_scope, enabled);
+
+CREATE TABLE IF NOT EXISTS runtime_meta (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS import_previews (
+    token              TEXT PRIMARY KEY,
+    filename           TEXT NOT NULL,
+    source_path        TEXT NOT NULL,
+    reference_version  INTEGER NOT NULL,
+    rows_json          TEXT NOT NULL,
+    summary_json       TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'open',
+    actor              TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    expires_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_previews_status ON import_previews(status, expires_at);
+"""
+
+
+MIGRATION_9 = """
+ALTER TABLE tasks ADD COLUMN auto_retry_hold INTEGER NOT NULL DEFAULT 0;
+"""
+
+
+MIGRATION_10 = """
+CREATE TABLE IF NOT EXISTS reference_tombstones (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (kind, key)
+);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", MIGRATION_1),
     Migration(2, "additional_indexes", MIGRATION_2),
@@ -425,4 +486,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(5, "machine_special_rule_confirmed", MIGRATION_5),
     Migration(6, "task_retry_budget", MIGRATION_6),
     Migration(7, "outbox_taskless_guidance", MIGRATION_7),
+    Migration(8, "lifecycle_reference_authority_import_preview", MIGRATION_8),
+    Migration(9, "restored_task_retry_hold", MIGRATION_9),
+    Migration(10, "reference_tombstones", MIGRATION_10),
 )

@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from . import state
 from .db import Database
+from .errors import BatchDisallowedError, ValidationError
 from .logging import JsonlLogger
 from .util import new_id, normalize_key, utc_now
 
@@ -125,11 +126,20 @@ class TaskRepository:
         kind: str | None = None,
         owner: str | None = None,
         search: str | None = None,
+        lifecycle: str = "active",
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
+        if lifecycle == "active":
+            clauses.append("t.archived_at IS NULL AND t.deleted_at IS NULL")
+        elif lifecycle == "archived":
+            clauses.append("t.archived_at IS NOT NULL AND t.deleted_at IS NULL")
+        elif lifecycle == "trashed":
+            clauses.append("t.deleted_at IS NOT NULL")
+        elif lifecycle == "all":
+            pass
         if status:
             clauses.append("t.status = ?")
             params.append(status)
@@ -162,8 +172,29 @@ class TaskRepository:
         )
         return [dict(row) for row in rows]
 
+    def lifecycle_counts(self) -> dict[str, int]:
+        rows = self.db.fetchall(
+            """
+            SELECT
+              SUM(CASE WHEN archived_at IS NULL AND deleted_at IS NULL THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN archived_at IS NOT NULL AND deleted_at IS NULL THEN 1 ELSE 0 END) AS archived,
+              SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS trashed
+            FROM tasks
+            """
+        )
+        if not rows:
+            return {"active": 0, "archived": 0, "trashed": 0}
+        row = rows[0]
+        return {
+            "active": int(row["active"] or 0),
+            "archived": int(row["archived"] or 0),
+            "trashed": int(row["trashed"] or 0),
+        }
+
     def counts(self) -> dict[str, int]:
-        rows = self.db.fetchall("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status")
+        rows = self.db.fetchall(
+            "SELECT status, COUNT(*) AS n FROM tasks WHERE deleted_at IS NULL GROUP BY status"
+        )
         return {str(row["status"]): int(row["n"]) for row in rows}
 
     def get_origin_mail(self, task_id: str) -> dict[str, Any] | None:
@@ -407,13 +438,13 @@ class TaskRepository:
                     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
                 self.db.insert(
                     "UPDATE tasks SET retry_count = ?, last_error = ?, next_retry_at = ?, "
-                    "updated_at = ? WHERE id = ?",
+                    "auto_retry_hold = 0, updated_at = ? WHERE id = ?",
                     (failures, error[:4000], next_retry_at, utc_now(), task_id),
                 )
             else:
                 self.db.insert(
-                    "UPDATE tasks SET last_error = ?, next_retry_at = ?, updated_at = ? "
-                    "WHERE id = ?",
+                    "UPDATE tasks SET last_error = ?, next_retry_at = ?, "
+                    "auto_retry_hold = 0, updated_at = ? WHERE id = ?",
                     (error[:4000], next_retry_at, utc_now(), task_id),
                 )
         else:
@@ -430,11 +461,16 @@ class TaskRepository:
         return self.require(task_id)
 
     def reset_retry_budget(self, task_id: str) -> None:
-        """Start a new failure episode after an explicit user/admin retry."""
+        """Start a new failure episode after an explicit user/admin retry.
+
+        Also clears ``auto_retry_hold``: an explicit retry is exactly the
+        operator/owner action required to resume a task that was restored from
+        the recycle bin.
+        """
 
         self.db.insert(
-            "UPDATE tasks SET retry_count = 0, failure_notified = 0, updated_at = ? "
-            "WHERE id = ?",
+            "UPDATE tasks SET retry_count = 0, failure_notified = 0, "
+            "auto_retry_hold = 0, updated_at = ? WHERE id = ?",
             (utc_now(), task_id),
         )
 
@@ -451,6 +487,8 @@ class TaskRepository:
             """
             SELECT id FROM tasks
              WHERE status = ?
+               AND deleted_at IS NULL
+               AND auto_retry_hold = 0
                AND (next_retry_at IS NULL OR next_retry_at <= ?)
              ORDER BY updated_at LIMIT ?
             """,
@@ -496,7 +534,8 @@ class TaskRepository:
                 UPDATE tasks SET version = ?, updated_at = ?,
                                  reprocess_confirmed = 0, content_hash = NULL,
                                  business_identity = NULL, last_error = NULL,
-                                 retry_count = 0, failure_notified = 0
+                                 retry_count = 0, failure_notified = 0,
+                                 auto_retry_hold = 0
                  WHERE id = ?
                 """,
                 (new_version, now, task_id),
@@ -662,7 +701,8 @@ class TaskRepository:
                 UPDATE tasks SET version = ?, updated_at = ?,
                                  reprocess_confirmed = 0, content_hash = NULL,
                                  business_identity = NULL, last_error = NULL,
-                                 retry_count = 0, failure_notified = 0
+                                 retry_count = 0, failure_notified = 0,
+                                 auto_retry_hold = 0
                  WHERE id = ?
                 """,
                 (new_version, now, task_id),
@@ -1135,6 +1175,303 @@ class TaskRepository:
                 item["detail"] = item.pop("detail_json")
             result.append(item)
         return result
+
+    # ------------------------------------------------------------------
+    # lifecycle: archive / trash (recycle bin) / restore
+    # ------------------------------------------------------------------
+    # A task in any of these statuses, or with an outbox row mid-send, cannot
+    # be moved to the recycle bin: doing so would abandon an in-flight
+    # operation or a delivery whose result is uncertain. The operator must
+    # first let processing finish or resolve the send result.
+    TRASH_BLOCKED_STATUSES = frozenset(
+        {state.PROCESSING, state.VALIDATING, state.SEND_UNKNOWN}
+    )
+
+    def _trash_blocked_reason_conn(self, conn, task: dict[str, Any]) -> str | None:
+        """Compute the delete-block reason using ``conn`` so the check can run
+        inside the same transaction as the write (no TOCTOU window)."""
+
+        status = str(task["status"])
+        if status in self.TRASH_BLOCKED_STATUSES:
+            if status == state.SEND_UNKNOWN:
+                return "发送结果不确定，请先核对发送结果后再删除"
+            return "任务正在处理中，请等待处理结束后再删除"
+        # Any in-flight or uncertain outbox row blocks deletion, not only the
+        # task status: a task can be READY_TO_SEND while an outbox row is mid
+        # send or its delivery result is unknown.
+        row = conn.execute(
+            """
+            SELECT status FROM outbox
+             WHERE task_id = ? AND status IN ('sending', 'send_unknown')
+             LIMIT 1
+            """,
+            (str(task["id"]),),
+        ).fetchone()
+        if row is not None:
+            if str(row["status"]) == "sending":
+                return "该任务有邮件正在发送，请等待发送结束后再删除"
+            return "该任务有发送结果不确定的邮件，请先核对发送结果后再删除"
+        return None
+
+    @staticmethod
+    def _event(conn, task_id: str, version: int, code: str, *, actor: str, now: str, detail=None) -> None:
+        conn.execute(
+            """
+            INSERT INTO task_events (
+                task_id, version, stage, code, detail_json, actor, created_at
+            ) VALUES (?, ?, 'admin', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                version,
+                code,
+                json.dumps(detail, ensure_ascii=False) if detail else None,
+                actor,
+                now,
+            ),
+        )
+
+    def _apply_archive(self, conn, row, *, actor: str, reason: str | None, now: str) -> None:
+        task_id = str(row["id"])
+        conn.execute(
+            "UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, task_id),
+        )
+        self._event(
+            conn, task_id, int(row["version"]), "task_archived",
+            actor=actor, now=now, detail={"reason": reason} if reason else None,
+        )
+
+    def _apply_unarchive(self, conn, row, *, actor: str, now: str) -> None:
+        task_id = str(row["id"])
+        conn.execute(
+            "UPDATE tasks SET archived_at = NULL, updated_at = ? WHERE id = ?",
+            (now, task_id),
+        )
+        self._event(conn, task_id, int(row["version"]), "task_unarchived", actor=actor, now=now)
+
+    def _apply_delete(self, conn, row, *, actor: str, reason: str | None, now: str) -> None:
+        task_id = str(row["id"])
+        conn.execute(
+            "UPDATE tasks SET deleted_at = ?, deletion_reason = ?, archived_at = NULL, updated_at = ? WHERE id = ?",
+            (now, reason, now, task_id),
+        )
+        # Cancel pending/dry_run/failed outbox rows so the poller will not send
+        # them. SENT, SENDING and SEND_UNKNOWN rows are left intact; SENDING was
+        # already blocked by validation, and SENT/SEND_UNKNOWN are audit
+        # evidence that must be resolved, not silently dropped.
+        conn.execute(
+            """
+            UPDATE outbox SET status = 'cancelled', last_error = COALESCE(last_error, '任务已删除到回收站')
+             WHERE task_id = ? AND status IN ('pending', 'dry_run', 'failed')
+            """,
+            (task_id,),
+        )
+        self._event(
+            conn, task_id, int(row["version"]), "task_deleted",
+            actor=actor, now=now, detail={"reason": reason} if reason else None,
+        )
+
+    def _apply_restore(self, conn, row, *, actor: str, now: str) -> None:
+        task_id = str(row["id"])
+        # Restoring must not trigger automatic re-processing. A RETRY_PENDING
+        # task would otherwise be due for the poller immediately; put it on hold
+        # so only an explicit operator/owner retry resumes it. The status itself
+        # is preserved (history intact); the hold is cleared by reset_retry_budget.
+        hold = 1 if str(row["status"]) == state.RETRY_PENDING else 0
+        conn.execute(
+            "UPDATE tasks SET deleted_at = NULL, deletion_reason = NULL, "
+            "auto_retry_hold = ?, updated_at = ? WHERE id = ?",
+            (hold, now, task_id),
+        )
+        self._event(
+            conn,
+            task_id,
+            int(row["version"]),
+            "task_restored",
+            actor=actor,
+            now=now,
+            detail={"status": str(row["status"]), "auto_retry_hold": bool(hold)},
+        )
+
+    def archive(self, task_id: str, *, actor: str, reason: str | None = None) -> dict[str, Any]:
+        """Hide a task without changing processing or sending behaviour."""
+
+        now = utc_now()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["archived_at"] is None:
+                self._apply_archive(conn, row, actor=actor, reason=reason, now=now)
+        self.logger.info("task_archived", task_id=task_id, actor=actor)
+        return self.require(task_id)
+
+    def unarchive(self, task_id: str, *, actor: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["archived_at"] is not None:
+                self._apply_unarchive(conn, row, actor=actor, now=now)
+        return self.require(task_id)
+
+    def delete_to_trash(
+        self, task_id: str, *, actor: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Move a task to the recycle bin.
+
+        Future processing, retry, reprocess, supplement, delivery and poller
+        actions skip trashed tasks. Pending outbox rows for the task are
+        cancelled (records retained); restoring the task does not reactivate
+        them. Already-sent mail is never unsent; dedupe still recognises a
+        trashed completed task as processed.
+        """
+
+        now = utc_now()
+        with self.db.transaction() as conn:
+            # Re-read and re-check inside the write transaction. The check and
+            # the update are atomic under BEGIN IMMEDIATE, closing the TOCTOU
+            # window where a task could enter PROCESSING/SEND_UNKNOWN between a
+            # check and the delete.
+            current = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(task_id)
+            if current["deleted_at"] is not None:
+                return dict(current)
+            blocked = self._trash_blocked_reason_conn(conn, current)
+            if blocked is not None:
+                raise ValidationError(blocked)
+            self._apply_delete(conn, current, actor=actor, reason=reason, now=now)
+        self.logger.info("task_deleted_to_trash", task_id=task_id, actor=actor)
+        return self.require(task_id)
+
+    def restore_from_trash(self, task_id: str, *, actor: str) -> dict[str, Any]:
+        """Restore a trashed task. Does not re-send, re-process or release any
+        previously cancelled outbox row; each of those needs an explicit action.
+        """
+
+        now = utc_now()
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["deleted_at"] is None:
+                raise ValidationError("任务不在回收站")
+            self._apply_restore(conn, row, actor=actor, now=now)
+        self.logger.info("task_restored_from_trash", task_id=task_id, actor=actor)
+        return self.require(task_id)
+
+    def is_trashed(self, task_id: str) -> bool:
+        row = self.db.fetchone(
+            "SELECT deleted_at FROM tasks WHERE id = ?", (task_id,)
+        )
+        return row is not None and row["deleted_at"] is not None
+
+    # ------------------------------------------------------------------
+    # batch lifecycle: ONE transaction, re-validated, all-or-nothing
+    # ------------------------------------------------------------------
+    def _batch_reason_conn(self, conn, row, *, action: str) -> str | None:
+        if action == "delete":
+            if row["deleted_at"] is not None:
+                return "任务已在回收站"
+            return self._trash_blocked_reason_conn(conn, row)
+        if action == "restore":
+            if row["deleted_at"] is None:
+                return "任务不在回收站"
+            return None
+        if action == "archive":
+            if row["deleted_at"] is not None:
+                return "任务已删除，先从回收站恢复"
+            return None
+        if action == "unarchive":
+            if row["archived_at"] is None:
+                return "任务未归档"
+            return None
+        raise ValidationError(f"未知批量操作：{action}")
+
+    def _batch_action(
+        self,
+        task_ids: list[str],
+        *,
+        action: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a batch lifecycle action atomically.
+
+        Validation and every write happen inside a single ``BEGIN IMMEDIATE``
+        transaction: if any item is disallowed (or any write fails) the whole
+        batch is rolled back, so there is never a partial apply.
+        """
+
+        if not task_ids:
+            raise ValidationError("未选择任何任务")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for task_id in task_ids:
+            tid = str(task_id).strip()
+            if tid and tid not in seen:
+                seen.add(tid)
+                deduped.append(tid)
+        now = utc_now()
+        with self.db.transaction() as conn:
+            rows: list[Any] = []
+            disallowed: list[dict[str, str]] = []
+            for tid in deduped:
+                row = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                if row is None:
+                    disallowed.append({"task_id": tid, "reason": "任务不存在"})
+                    continue
+                why = self._batch_reason_conn(conn, row, action=action)
+                if why is not None:
+                    disallowed.append({"task_id": tid, "reason": why})
+                    continue
+                rows.append(row)
+            if disallowed:
+                # Raising inside the transaction rolls back every statement;
+                # nothing was applied.
+                raise BatchDisallowedError(disallowed)
+            for row in rows:
+                if action == "archive":
+                    self._apply_archive(conn, row, actor=actor, reason=reason, now=now)
+                elif action == "unarchive":
+                    self._apply_unarchive(conn, row, actor=actor, now=now)
+                elif action == "delete":
+                    self._apply_delete(conn, row, actor=actor, reason=reason, now=now)
+                elif action == "restore":
+                    self._apply_restore(conn, row, actor=actor, now=now)
+        self.logger.info(
+            "task_batch_lifecycle", action=action, count=len(rows), actor=actor
+        )
+        return {"count": len(rows), "action": action}
+
+    def batch_archive(
+        self, task_ids: list[str], *, actor: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        return self._batch_action(task_ids, action="archive", actor=actor, reason=reason)
+
+    def batch_unarchive(self, task_ids: list[str], *, actor: str) -> dict[str, Any]:
+        return self._batch_action(task_ids, action="unarchive", actor=actor)
+
+    def batch_delete(
+        self, task_ids: list[str], *, actor: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        return self._batch_action(task_ids, action="delete", actor=actor, reason=reason)
+
+    def batch_restore(self, task_ids: list[str], *, actor: str) -> dict[str, Any]:
+        return self._batch_action(task_ids, action="restore", actor=actor)
 
     def recover_incomplete(self, actor: str = "startup-recovery") -> list[str]:
         """Move tasks interrupted by a crash to RETRY_PENDING.

@@ -55,3 +55,20 @@ class DuplicateMessage(CaterError):
 
 class UnsupportedInput(CaterError):
     code = "UNSUPPORTED_INPUT"
+
+
+class BatchDisallowedError(CaterError):
+    """A batch lifecycle action had disallowed items; nothing was applied.
+
+    Carries the per-item reasons so the UI can list them before the operator
+    retries. The whole batch is rejected: there is never a partial apply.
+    """
+
+    code = "BATCH_DISALLOWED"
+
+    def __init__(self, items: list[dict[str, str]]) -> None:
+        self.items = items
+        super().__init__(
+            "部分任务不允许该操作，已全部撤销："
+            + "; ".join(f"{i['task_id']} ({i['reason']})" for i in items)
+        )

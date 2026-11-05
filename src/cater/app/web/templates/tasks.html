@@ -4,13 +4,18 @@
 <h1>任务</h1>
 
 <div class="chips">
-  <span class="chip">全部 {{ tasks|length }}</span>
+  <a class="chip {% if lifecycle == 'active' %}active{% endif %}" href="/?lifecycle=active">正常 {{ lifecycle_counts.active }}</a>
+  <a class="chip {% if lifecycle == 'archived' %}active{% endif %}" href="/?lifecycle=archived">归档 {{ lifecycle_counts.archived }}</a>
+  <a class="chip {% if lifecycle == 'trashed' %}active{% endif %}" href="/?lifecycle=trashed">回收站 {{ lifecycle_counts.trashed }}</a>
+</div>
+<div class="chips">
   {% for name, count in counts.items() %}
-    <a class="chip status-{{ name|lower }}" href="/?status={{ name }}">{{ name }} {{ count }}</a>
+    <a class="chip status-{{ name|lower }}" href="/?status={{ name }}&lifecycle={{ lifecycle }}">{{ name }} {{ count }}</a>
   {% endfor %}
 </div>
 
 <form class="filters" method="get" action="/">
+  <input type="hidden" name="lifecycle" value="{{ lifecycle }}">
   <label>状态
     <select name="status">
       <option value="">全部</option>
@@ -37,30 +42,56 @@
 </form>
 
 {% if tasks %}
-<table class="grid">
-  <thead>
-    <tr>
-      <th>状态</th><th>类型</th><th>发起人</th><th>主题</th><th>目的国</th>
-      <th>版本</th><th>问题</th><th>发件</th><th>更新时间</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for task in tasks %}
-    <tr>
-      <td><span class="badge status-{{ task.status|lower }}">{{ task.status }}</span></td>
-      <td>{{ task.kind }}</td>
-      <td class="nowrap">{{ task.owner_name or task.owner }}</td>
-      <td><a href="/tasks/{{ task.id }}">{{ task.mail_subject or "(无主题)" }}</a>
-        <div class="muted mono">{{ task.id }}</div></td>
-      <td>{{ task.destination_name or "-" }}{% if task.destination_alpha3 %} <span class="muted">({{ task.destination_alpha3 }})</span>{% endif %}</td>
-      <td>v{{ task.version }}</td>
-      <td>{% if task.open_issues %}<span class="badge warn">{{ task.open_issues }}</span>{% else %}0{% endif %}</td>
-      <td>{{ task.outbox_count }}</td>
-      <td class="nowrap">{{ task.updated_at }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<form method="post" action="/tasks/batch" class="batch">
+  {% include "_csrf.html" %}
+  <div class="batchbar">
+    <label class="checkall"><input type="checkbox" data-select-all> 全选</label>
+    <select name="action">
+      <option value="archive">归档</option>
+      <option value="unarchive">取消归档</option>
+      <option value="delete">删除到回收站</option>
+      <option value="restore">从回收站恢复</option>
+    </select>
+    <input type="text" name="reason" placeholder="原因（可选）" maxlength="200">
+    <button type="submit">应用到所选</button>
+  </div>
+  <table class="grid">
+    <thead>
+      <tr>
+        <th></th><th>状态</th><th>类型</th><th>发起人</th><th>主题</th><th>目的国</th>
+        <th>版本</th><th>问题</th><th>发件</th><th>更新时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for task in tasks %}
+      <tr>
+        <td><input type="checkbox" name="task_ids" value="{{ task.id }}"></td>
+        <td><span class="badge status-{{ task.status|lower }}">{{ task.status }}</span>
+          {% if task.archived_at %}<span class="badge">归档</span>{% endif %}
+          {% if task.deleted_at %}<span class="badge warn">回收站</span>{% endif %}
+        </td>
+        <td>{{ task.kind }}</td>
+        <td class="nowrap">{{ task.owner_name or task.owner }}</td>
+        <td><a href="/tasks/{{ task.id }}">{{ task.mail_subject or "(无主题)" }}</a>
+          <div class="muted mono">{{ task.id }}</div></td>
+        <td>{{ task.destination_name or "-" }}{% if task.destination_alpha3 %} <span class="muted">({{ task.destination_alpha3 }})</span>{% endif %}</td>
+        <td>v{{ task.version }}</td>
+        <td>{% if task.open_issues %}<span class="badge warn">{{ task.open_issues }}</span>{% else %}0{% endif %}</td>
+        <td>{{ task.outbox_count }}</td>
+        <td class="nowrap">{{ task.updated_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</form>
+{% if pages > 1 %}
+<nav class="pager">
+  {% for p in range(1, pages + 1) %}
+    <a class="chip {% if p == page %}active{% endif %}"
+       href="/?lifecycle={{ lifecycle }}{% if status %}&status={{ status }}{% endif %}{% if kind %}&kind={{ kind }}{% endif %}{% if search %}&search={{ search }}{% endif %}&limit={{ limit }}&page={{ p }}">{{ p }}</a>
+  {% endfor %}
+</nav>
+{% endif %}
 {% else %}
 <p class="empty">没有符合条件的任务。</p>
 {% endif %}

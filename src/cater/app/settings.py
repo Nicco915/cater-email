@@ -212,6 +212,19 @@ class SettingsService:
                         now,
                     ),
                 )
+            if values[MODE_KEY] == "production":
+                # Persist the permanent production marker in the SAME
+                # transaction as the mode change. This covers direct
+                # SettingsService use and in-process test->production switches
+                # that never restart the app, so test-clear stays blocked.
+                conn.execute(
+                    """
+                    INSERT INTO runtime_meta(key, value, created_at, updated_at)
+                    VALUES ('seen_production', '1', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+                    """,
+                    (now, now),
+                )
         # Audit log records changed key names, never credentials.
         self.logger.info(
             "configuration_updated",

@@ -166,10 +166,12 @@ class OutboxRepository:
         now = utc_now()
         rows = self.db.fetchall(
             """
-            SELECT * FROM outbox
-             WHERE status = ?
-               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-             ORDER BY created_at LIMIT ?
+            SELECT o.* FROM outbox o
+             LEFT JOIN tasks t ON t.id = o.task_id
+             WHERE o.status = ?
+               AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+               AND (o.task_id IS NULL OR t.deleted_at IS NULL)
+             ORDER BY o.created_at LIMIT ?
             """,
             (PENDING, now, max(1, min(int(limit), 100))),
         )
@@ -216,6 +218,18 @@ class OutboxRepository:
             if row is None:
                 raise KeyError(outbox_id)
             current = str(row["status"])
+            if target == SENDING and row["task_id"]:
+                # Claiming a real send must re-check the task inside the same
+                # transaction. A task may be moved to the recycle bin between
+                # list_due() and this claim; sending it then would violate the
+                # "deleted tasks do not send" guarantee.
+                task = conn.execute(
+                    "SELECT deleted_at FROM tasks WHERE id = ?", (row["task_id"],)
+                ).fetchone()
+                if task is not None and task["deleted_at"] is not None:
+                    raise StateTransitionError(
+                        "该任务已删除到回收站，不能发送；请先恢复任务"
+                    )
             if allowed_from is not None and current not in allowed_from:
                 raise StateTransitionError(
                     f"Outbox {outbox_id} is {current}; expected one of {sorted(allowed_from)}"

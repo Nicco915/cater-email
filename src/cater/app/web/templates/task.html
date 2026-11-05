@@ -46,6 +46,41 @@
     {% endif %}
   </div>
   <p class="muted">“仅重新生成”不会创建新的发件箱记录；需要另行确认“创建交付邮件”。</p>
+  <div class="actions lifecycle">
+    {% if task.deleted_at %}
+    <span class="badge warn">回收站</span>
+    <form method="post" action="/tasks/{{ task.id }}/restore">
+      {% include "_csrf.html" %}
+      <button type="submit">从回收站恢复</button>
+    </form>
+    {% if task.status in ["COMPLETED", "CANCELLED", "FAILED", "WAITING_INPUT", "READY_TO_SEND"] %}
+    <a class="button danger" href="/tasks/{{ task.id }}/purge">永久清理任务文件…</a>
+    {% endif %}
+    {% else %}
+    {% if task.archived_at %}
+    <span class="badge">已归档</span>
+    <form method="post" action="/tasks/{{ task.id }}/unarchive">
+      {% include "_csrf.html" %}
+      <button type="submit">取消归档</button>
+    </form>
+    {% else %}
+    <form method="post" action="/tasks/{{ task.id }}/archive">
+      {% include "_csrf.html" %}
+      <button type="submit">归档（仅隐藏）</button>
+    </form>
+    {% endif %}
+    {% if task.status in ["PROCESSING", "VALIDATING", "SEND_UNKNOWN"] %}
+    <span class="muted">状态 {{ task.status }} 不允许删除：请等待处理结束或先核对发送结果。</span>
+    {% else %}
+    <form method="post" action="/tasks/{{ task.id }}/delete">
+      {% include "_csrf.html" %}
+      <input type="text" name="reason" placeholder="删除原因（可选）" maxlength="200">
+      <button type="submit" class="danger">删除到回收站</button>
+    </form>
+    {% endif %}
+    {% endif %}
+  </div>
+  <p class="muted">归档仅隐藏任务，不改变处理与发信行为；删除会暂停该任务未来的处理、重试与未发送通知，已发送邮件不会被撤回，恢复后不会自动重发或重算。</p>
 </section>
 
 <section class="panel">

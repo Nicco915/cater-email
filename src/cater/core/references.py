@@ -18,16 +18,27 @@ def _norm_key(text: str) -> str:
 
 
 class CountryIndex:
-    """alpha3/中文名/英文名/alpha2/显式别名 → 三位码。别名冲突即报错。"""
+    """alpha3/中文名/英文名/alpha2/显式别名 → 三位码。别名冲突即报错。
 
-    def __init__(self, reference_countries: Optional[list] = None):
+    When ``authoritative`` is set (the app always sends this for live tasks),
+    the SQLite reference data is the single source of truth: the built-in
+    country table is not loaded, so a country an operator deleted or disabled
+    can never be matched through the core's fallback. Offline/CLI use without a
+    reference payload keeps the built-in table for compatibility.
+    """
+
+    def __init__(self, reference_countries: Optional[list] = None, *, authoritative: bool = False):
         self._alias_to_alpha3: dict = {}
         self._alpha3_to_name: dict = {}
         self.conflicts: list = []
-        for alpha2, alpha3, zh, en in BUILTIN_COUNTRIES:
-            self._alpha3_to_name.setdefault(alpha3, zh)
-            for key in (alpha2, alpha3, zh, en):
-                self._bind(key, alpha3, builtin=True)
+        self.authoritative = bool(authoritative)
+        if not authoritative:
+            # Offline compatibility only: never used when the app sends a
+            # database-authoritative snapshot.
+            for alpha2, alpha3, zh, en in BUILTIN_COUNTRIES:
+                self._alpha3_to_name.setdefault(alpha3, zh)
+                for key in (alpha2, alpha3, zh, en):
+                    self._bind(key, alpha3, builtin=True)
         for entry in reference_countries or []:
             alpha3 = str(entry.get("alpha3", "")).strip().upper()
             if not alpha3:
@@ -72,12 +83,20 @@ class MachineIndex:
     同一机型可有多条不同 scope 的条目（如 915F：default=110KW、BRA=123KW，
     用户已确认的规则：目的国 BRA 用 A=巴西 记录，其余国家用 A 空记录）。
     匹配时按 request.destination.alpha3 选 scope，未命中回退 default。
+
+    当快照含 ``enabled`` 字段（数据库权威模式）时：停用的 scope 条目不
+    参与 fallback——即 BRA scope 停用后，目的国 BRA 不会静默回退到
+    default 110KW，而是按未匹配处理，由转换层暂停追问。停用机型的别名也
+    不再命中（app 在快照中已剔除停用别名）。
     """
 
     def __init__(self, machines: Optional[list] = None, aliases: Optional[dict] = None):
         self._models: dict = {}   # model_norm -> {scope -> entry}
         self.issues: list = []
         self.deferred_unconfirmed: dict = {}  # model_norm -> entry（特殊规则未确认，暂停匹配）
+        self._authoritative = bool(machines) and any(
+            isinstance(e, dict) and "enabled" in e for e in (machines or [])
+        )
         for entry in machines or []:
             model = str(entry.get("model", "")).strip()
             if not model:
@@ -98,6 +117,11 @@ class MachineIndex:
                 continue
             self._aliases[k] = target
 
+    def _enabled(self, entry) -> bool:
+        if not self._authoritative:
+            return True
+        return bool(entry.get("enabled", True))
+
     def _resolve(self, model, destination_alpha3):
         key = _norm_key(model)
         if key not in self._models and key in self._aliases:
@@ -107,14 +131,25 @@ class MachineIndex:
             return None
         scope = str(destination_alpha3 or "").strip().upper()
         entry = scopes.get(scope)
-        if entry is None or scope == "":
-            entry = scopes.get("DEFAULT", entry)
-        if entry is not None and scope not in ("", "DEFAULT") \
-                and not entry.get("special_rule_confirmed", True):
-            # 特殊配置规则未获用户确认：暂停匹配，由转换层登记追问
-            self.deferred_unconfirmed[key] = entry
+        # A disabled scope entry blocks fallback: the operator deliberately
+        # turned off the special configuration, so we must not silently use the
+        # default scope for that destination.
+        if entry is not None and self._enabled(entry):
+            resolved = entry
+        elif entry is not None and not self._enabled(entry) and scope not in ("", "DEFAULT"):
+            resolved = None  # disabled special scope: no fallback
+        else:
+            # No entry for this scope (or it is the empty/default request scope):
+            # fall back to the default scope entry, if enabled.
+            default_entry = scopes.get("DEFAULT")
+            resolved = default_entry if (default_entry is not None and self._enabled(default_entry)) else None
+        if resolved is None:
             return None
-        return entry
+        if scope not in ("", "DEFAULT") and not resolved.get("special_rule_confirmed", True):
+            # 特殊配置规则未获用户确认：暂停匹配，由转换层登记追问
+            self.deferred_unconfirmed[key] = resolved
+            return None
+        return resolved
 
     def match(self, model, destination_alpha3: Optional[str] = None) -> Optional[dict]:
         """精确匹配标准机型（含显式别名）；按目的国 scope 选变体，未命中回退 default。"""

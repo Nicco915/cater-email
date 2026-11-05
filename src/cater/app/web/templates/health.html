@@ -60,4 +60,22 @@
   </table>
   {% else %}<p class="empty">尚无备份。可运行 <span class="mono">cater-app backup</span>。</p>{% endif %}
 </section>
+
+<section class="panel">
+  <h2>清空测试任务数据</h2>
+  <p>初始化身份：<strong>{{ test_clear.identity }}</strong>；当前模式：<strong>{{ test_clear.current_mode }}</strong>；曾用于生产：{{ "是" if test_clear.seen_production else "否" }}；进行中任务：{{ test_clear.in_progress_tasks }}</p>
+  {% if test_clear.eligible %}
+    {% if test_clear.blockers %}
+    <p class="warn">当前不可清空：{{ test_clear.blockers | join("；") }}</p>
+    {% endif %}
+  <p class="warn">将清除：{{ test_clear.removes | join("；") }}。保留：{{ test_clear.keeps | join("；") }}。操作前会先备份；文件清理失败会中止且不改动数据库。</p>
+  <form method="post" action="/maintenance/clear-test" class="stack">
+    {% include "_csrf.html" %}
+    <label class="checkall"><input type="checkbox" name="confirm" value="1"> 我确认清空当前测试目录的测试任务数据（不会触碰生产或其他 runtime）</label>
+    <button type="submit" class="danger" {% if test_clear.blockers %}disabled{% endif %}>清空测试数据</button>
+  </form>
+  {% else %}
+  <p class="muted">当前运行目录未可靠判定为测试身份（或曾用于生产），清空已禁用，以保护生产数据。</p>
+  {% endif %}
+</section>
 {% endblock %}

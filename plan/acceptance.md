@@ -40,3 +40,13 @@
 - 协调者独立完整测试：219 passed、3 skipped（无pwsh）。
 - 协调者另模拟v5到v7的非空库升级：原任务和SEND_UNKNOWN outbox、发送次数保留，foreign_key_check无错误。
 - 无真实外发；Windows和真实邮箱实测仍由用户执行。历史补扫仍暂缓，详见plan/follow-ups.md。
+
+## 网页管理追加验收（2026-11-05）
+
+- Claude实现任务归档/回收站、四类参考资料CRUD和批量启停、Excel导入预览确认、SQLite权威模式和种子补齐。
+- 审核返工：整批事务及故障回滚、删除/发送竞争保护、恢复后重试挂起、测试身份与生产永久标记、历史引用保护、导入TOCTOU、父子启停分离、别名完整操作、CN/CHN回归、嵌套表单和全选修复、机型编辑与真实分页。
+- 协调者独立实单检查：机型导入55条，配件READY_TO_SEND生成1份，整机msg READY_TO_SEND生成2份，CN→CHN；全程假SMTP/dry-run。
+- 协调者故障注入：批量国家停用第二项写入失败，两项全部回滚。v7非空库升级至v10保留任务、发送不确定状态及次数，外键无错误。
+- Windows真实浏览器、PowerShell与真实邮箱仍需用户实机验证，开发测试不等同生产验收。
+
+- 本轮最终协调者独立全量测试：`python3 -m pytest -q`，299 passed、3 skipped，耗时34.24秒；跳过仅限缺pwsh的Windows动态脚本测试。

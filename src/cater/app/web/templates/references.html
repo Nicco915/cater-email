@@ -2,9 +2,20 @@
 {% block title %}参考资料 · CATER{% endblock %}
 {% block content %}
 <h1>参考资料</h1>
-<p class="muted">国家与机型匹配只做精确规范化匹配和显式别名；不会模糊猜测或静默覆盖冲突。</p>
+<p class="muted">国家与机型匹配只做精确规范化匹配和显式别名；不会模糊猜测或静默覆盖冲突。SQLite 数据为权威来源：新增或停用资料影响新任务，不改历史任务快照；同版本技术重试用原快照，显式新版本重处理用最新参考资料。删除/停用不会在重启后重生。</p>
 
 <div class="grid2 panels">
+  <section class="panel">
+    <h2>新增国家</h2>
+    <form method="post" action="/references/countries" class="stack">
+      {% include "_csrf.html" %}
+      <label>ISO alpha-3（三位大写，主键，不可改） <input type="text" name="alpha3" required pattern="[A-Za-z]{3}" maxlength="3"></label>
+      <label>中文名 <input type="text" name="name_zh" required maxlength="80"></label>
+      <label>英文名 <input type="text" name="name_en" maxlength="80"></label>
+      <button type="submit">新增国家</button>
+    </form>
+  </section>
+
   <section class="panel">
     <h2>新增国家别名</h2>
     <form method="post" action="/references/alias" class="stack">
@@ -14,62 +25,241 @@
       <button type="submit">保存别名</button>
     </form>
   </section>
-
-  <section class="panel">
-    <h2>导入机型库</h2>
-    <p class="muted">仅接受 Sheet1 的 xlsx 机型库；同机型不同目的国范围可共存，同范围且申报资料不同会被拒绝。导入由业务核心解析。</p>
-    <form method="post" action="/references/machines/import" enctype="multipart/form-data" class="stack">
-      {% include "_csrf.html" %}
-      <input type="file" name="file" accept=".xlsx" required>
-      <button type="submit">上传并导入</button>
-    </form>
-  </section>
 </div>
 
 <section class="panel">
-  <h2>国家（{{ countries|length }}）</h2>
+  <h2>国家（{{ country_total }}，第 {{ country_page }}/{{ country_pages }} 页）</h2>
+  <form class="filters" method="get" action="/references">
+    <input type="search" name="country_search" value="{{ country_search }}" placeholder="搜索三位码/中英文名">
+    <button type="submit">搜索</button>
+  </form>
+  <!-- Batch form is a sibling (never an ancestor) of the row action forms. -->
+  <form id="batch-country" method="post" action="/references/batch" class="batch">
+    {% include "_csrf.html" %}
+    <input type="hidden" name="resource" value="country">
+    <div class="batchbar">
+      <label class="checkall"><input type="checkbox" data-select-all> 全选</label>
+      <button type="submit" name="enabled" value="0">批量停用</button>
+      <button type="submit" name="enabled" value="1">批量启用</button>
+    </div>
+  </form>
   <table class="grid">
-    <thead><tr><th>三位码</th><th>中文名</th><th>英文名</th></tr></thead>
+    <thead><tr><th></th><th>三位码</th><th>中文名</th><th>英文名</th><th>状态</th><th>操作</th></tr></thead>
     <tbody>
-      {% for country in countries %}
-      <tr><td class="mono">{{ country.alpha3 }}</td><td>{{ country.name_zh }}</td><td>{{ country.name_en }}</td></tr>
-      {% endfor %}
+    {% for country in countries %}
+    <tr>
+      <td><input type="checkbox" name="country_alpha3" value="{{ country.alpha3 }}" form="batch-country"></td>
+      <td class="mono">{{ country.alpha3 }}</td>
+      <td>{{ country.name_zh }}</td>
+      <td>{{ country.name_en }}</td>
+      <td>{% if country.enabled %}启用{% else %}<span class="badge warn">停用</span>{% endif %}</td>
+      <td class="actions">
+        <form method="post" action="/references/countries/{{ country.alpha3 }}">
+          {% include "_csrf.html" %}
+          <input type="text" name="name_zh" value="{{ country.name_zh }}" maxlength="80">
+          <input type="text" name="name_en" value="{{ country.name_en }}" maxlength="80">
+          <button type="submit">改名</button>
+        </form>
+        <form method="post" action="/references/countries/{{ country.alpha3 }}/enabled">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="enabled" value="{% if country.enabled %}0{% else %}1{% endif %}">
+          <button type="submit">{% if country.enabled %}停用{% else %}启用{% endif %}</button>
+        </form>
+        <form method="post" action="/references/countries/{{ country.alpha3 }}/delete">
+          {% include "_csrf.html" %}
+          <button type="submit">删除（默认停用）</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
     </tbody>
   </table>
+  {% if country_pages > 1 %}
+  <nav class="pager">
+    {% for p in range(1, country_pages + 1) %}
+    <a class="chip {% if p == country_page %}active{% endif %}"
+       href="/references?country_page={{ p }}{% if country_search %}&country_search={{ country_search }}{% endif %}{% if machine_search %}&machine_search={{ machine_search }}{% endif %}#countries">{{ p }}</a>
+    {% endfor %}
+  </nav>
+  {% endif %}
 </section>
 
 <section class="panel">
   <h2>国家别名（{{ aliases|length }}）</h2>
+  <form id="batch-country-alias" method="post" action="/references/batch" class="batch">
+    {% include "_csrf.html" %}
+    <input type="hidden" name="resource" value="country_alias">
+    <div class="batchbar">
+      <label class="checkall"><input type="checkbox" data-select-all> 全选</label>
+      <button type="submit" name="enabled" value="0">批量停用</button>
+      <button type="submit" name="enabled" value="1">批量启用</button>
+    </div>
+  </form>
   <table class="grid">
-    <thead><tr><th>别名</th><th>规范化</th><th>三位码</th><th>国家</th></tr></thead>
+    <thead><tr><th></th><th>别名</th><th>规范化</th><th>三位码</th><th>国家</th><th>状态</th><th>操作</th></tr></thead>
     <tbody>
-      {% for alias in aliases %}
-      <tr><td>{{ alias.alias_raw }}</td><td class="mono">{{ alias.alias_norm }}</td><td class="mono">{{ alias.alpha3 }}</td><td>{{ alias.name_zh }}</td></tr>
-      {% endfor %}
+    {% for alias in aliases %}
+    <tr>
+      <td><input type="checkbox" name="country_alias_key" value="{{ alias.alias_norm }}" form="batch-country-alias"></td>
+      <td>{{ alias.alias_raw }}</td><td class="mono">{{ alias.alias_norm }}</td><td class="mono">{{ alias.alpha3 }}</td><td>{{ alias.name_zh }}</td>
+      <td>{% if alias.enabled %}启用{% else %}<span class="badge warn">停用</span>{% endif %}</td>
+      <td class="actions">
+        <form method="post" action="/references/aliases/{{ alias.alias_norm }}/edit">
+          {% include "_csrf.html" %}
+          <input type="text" name="alias" value="{{ alias.alias_raw }}" maxlength="120">
+          <button type="submit">改名</button>
+        </form>
+        <form method="post" action="/references/aliases/{{ alias.alias_norm }}/enabled">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="enabled" value="{% if alias.enabled %}0{% else %}1{% endif %}">
+          <button type="submit">{% if alias.enabled %}停用{% else %}启用{% endif %}</button>
+        </form>
+        <form method="post" action="/references/aliases/{{ alias.alias_norm }}/delete">
+          {% include "_csrf.html" %}
+          <button type="submit">删除别名</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
     </tbody>
   </table>
 </section>
 
 <section class="panel">
-  <h2>机型（{{ machines|length }}）</h2>
+  <h2>机型别名（{{ machine_aliases|length }}）</h2>
+  <form method="post" action="/references/machine-aliases" class="stack">
+    {% include "_csrf.html" %}
+    <div class="grid2">
+      <label>目标机型（规范化或原名） <input type="text" name="model" required maxlength="60"></label>
+      <label>目的国范围（留空=默认） <input type="text" name="destination_scope" maxlength="3"></label>
+      <label>别名 <input type="text" name="alias" required maxlength="120"></label>
+    </div>
+    <button type="submit">新增机型别名</button>
+  </form>
+  {% if machine_aliases %}
+  <form id="batch-machine-alias" method="post" action="/references/batch" class="batch">
+    {% include "_csrf.html" %}
+    <input type="hidden" name="resource" value="machine_alias">
+    <div class="batchbar">
+      <label class="checkall"><input type="checkbox" data-select-all> 全选</label>
+      <button type="submit" name="enabled" value="0">批量停用</button>
+      <button type="submit" name="enabled" value="1">批量启用</button>
+    </div>
+  </form>
+  <table class="grid">
+    <thead><tr><th></th><th>别名</th><th>机型</th><th>scope</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for a in machine_aliases %}
+    <tr>
+      <td><input type="checkbox" name="machine_alias_key" value="{{ a.alias_norm }}|{{ a.destination_scope }}" form="batch-machine-alias"></td>
+      <td>{{ a.alias_raw }}</td><td class="mono">{{ a.model or a.model_norm }}</td>
+      <td class="mono">{{ a.destination_scope or "default" }}</td>
+      <td>{% if a.enabled %}启用{% else %}<span class="badge warn">停用</span>{% endif %}</td>
+      <td class="actions">
+        <form method="post" action="/references/machine-aliases/{{ a.alias_norm }}/{{ a.destination_scope or 'default' }}/edit">
+          {% include "_csrf.html" %}
+          <input type="text" name="alias" value="{{ a.alias_raw }}" maxlength="120">
+          <button type="submit">改名</button>
+        </form>
+        <form method="post" action="/references/machine-aliases/{{ a.alias_norm }}/{{ a.destination_scope or 'default' }}/enabled">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="enabled" value="{% if a.enabled %}0{% else %}1{% endif %}">
+          <button type="submit">{% if a.enabled %}停用{% else %}启用{% endif %}</button>
+        </form>
+        <form method="post" action="/references/machine-aliases/{{ a.alias_norm }}/{{ a.destination_scope or 'default' }}/delete">
+          {% include "_csrf.html" %}
+          <button type="submit">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>导入机型库（预览→确认）</h2>
+  <p class="muted">仅接受 Sheet1 的 xlsx；上传后先预览新增/未变化/修改/停用影响，确认后才写入，取消不更改资料。同批同 scope 矛盾整体拒绝；停用资料不会被自动复活。</p>
+  <form method="post" action="/references/machines/import" enctype="multipart/form-data" class="stack">
+    {% include "_csrf.html" %}
+    <input type="file" name="file" accept=".xlsx" required>
+    <button type="submit">上传并预览</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>新增机型记录</h2>
+  <form method="post" action="/references/machines" class="stack">
+    {% include "_csrf.html" %}
+    <div class="grid2">
+      <label>机型（必填） <input type="text" name="model" required maxlength="60"></label>
+      <label>目的国范围（alpha3，留空=默认） <input type="text" name="destination_scope" maxlength="3"></label>
+      <label>英文品名 <input type="text" name="english_name" maxlength="120"></label>
+      <label>商品编码 <input type="text" name="hs_code" maxlength="20"></label>
+      <label>商品名称 <input type="text" name="product_name" maxlength="120"></label>
+      <label>特殊标记 <input type="text" name="special" maxlength="40"></label>
+    </div>
+    <label>申报要素 <textarea name="declaration" rows="2"></textarea></label>
+    <label>备注 <input type="text" name="notes" maxlength="200"></label>
+    <label class="checkall"><input type="checkbox" name="special_rule_confirmed" value="1"> 特殊规则已确认（仅 915F 巴西 123KW 等已确认规则勾选，未确认不要勾选）</label>
+    <button type="submit">新增机型</button>
+  </form>
+</section>
+
+<section class="panel" id="machines">
+  <h2>机型（{{ machine_total }}，第 {{ machine_page }}/{{ machine_pages }} 页）</h2>
+  <form class="filters" method="get" action="/references">
+    <input type="search" name="machine_search" value="{{ machine_search }}" placeholder="搜索机型/品名">
+    <button type="submit">搜索</button>
+  </form>
+  <form id="batch-machine" method="post" action="/references/batch" class="batch">
+    {% include "_csrf.html" %}
+    <input type="hidden" name="resource" value="machine">
+    <div class="batchbar">
+      <label class="checkall"><input type="checkbox" data-select-all> 全选</label>
+      <button type="submit" name="enabled" value="0">批量停用</button>
+      <button type="submit" name="enabled" value="1">批量启用</button>
+    </div>
+  </form>
   {% if machines %}
   <table class="grid">
-    <thead><tr><th>机型</th><th>目的国范围</th><th>特殊标记</th><th>英文品名</th><th>商品编码</th><th>商品名称</th><th>申报要素</th><th>别名</th></tr></thead>
+    <thead><tr><th></th><th>机型</th><th>scope</th><th>特殊</th><th>英文品名</th><th>商品编码</th><th>申报要素</th><th>状态</th><th>操作</th></tr></thead>
     <tbody>
-      {% for machine in machines %}
-      <tr>
-        <td class="mono">{{ machine.model }}</td>
-        <td class="mono">{{ machine.destination_scope or "default" }}</td>
-        <td>{{ machine.special or "-" }}{% if machine.special and not machine.special_rule_confirmed %} <span class="badge warn">未确认</span>{% endif %}</td>
-        <td>{{ machine.english_name or "-" }}</td>
-        <td class="mono">{{ machine.hs_code or "-" }}</td>
-        <td>{{ machine.product_name or "-" }}</td>
-        <td class="pre">{{ machine.declaration or "-" }}</td>
-        <td>{{ machine.aliases | join("、") }}</td>
-      </tr>
-      {% endfor %}
+    {% for m in machines %}
+    <tr>
+      <td><input type="checkbox" name="machine_key" value="{{ m.model_norm }}|{{ m.destination_scope }}" form="batch-machine"></td>
+      <td class="mono">{{ m.model }}</td>
+      <td class="mono">{{ m.destination_scope or "default" }}</td>
+      <td>{{ m.special or "-" }}{% if m.special and not m.special_rule_confirmed %} <span class="badge warn">未确认</span>{% endif %}</td>
+      <td>{{ m.english_name or "-" }}</td>
+      <td class="mono">{{ m.hs_code or "-" }}</td>
+      <td class="pre">{{ m.declaration or "-" }}</td>
+      <td>{% if m.enabled %}启用{% else %}<span class="badge warn">停用</span>{% endif %}</td>
+      <td class="actions">
+        <a class="button" href="/references/machines/{{ m.model_norm }}/{{ m.destination_scope or 'default' }}/edit">编辑</a>
+        <form method="post" action="/references/machines/{{ m.model_norm }}/{{ m.destination_scope or 'default' }}/enabled">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="enabled" value="{% if m.enabled %}0{% else %}1{% endif %}">
+          <button type="submit">{% if m.enabled %}停用{% else %}启用{% endif %}</button>
+        </form>
+        <form method="post" action="/references/machines/{{ m.model_norm }}/{{ m.destination_scope or 'default' }}/delete">
+          {% include "_csrf.html" %}
+          <button type="submit">删除（默认停用）</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
     </tbody>
   </table>
   {% else %}<p class="empty">机型库为空；请上传核心认可的 xlsx 文件。</p>{% endif %}
+  {% if machine_pages > 1 %}
+  <nav class="pager">
+    {% for p in range(1, machine_pages + 1) %}
+    <a class="chip {% if p == machine_page %}active{% endif %}"
+       href="/references?machine_page={{ p }}{% if machine_search %}&machine_search={{ machine_search }}{% endif %}{% if country_search %}&country_search={{ country_search }}{% endif %}#machines">{{ p }}</a>
+    {% endfor %}
+  </nav>
+  {% endif %}
 </section>
 {% endblock %}

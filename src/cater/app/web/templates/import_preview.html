@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}机型库导入预览 · CATER{% endblock %}
+{% block content %}
+<h1>机型库导入预览</h1>
+
+{% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+
+{% if preview %}
+<section class="panel">
+  <h2>预览摘要</h2>
+  <p>文件：{{ preview.filename }}</p>
+  <ul>
+    <li>新增：{{ summary.new }}</li>
+    <li>未变化：{{ summary.unchanged }}</li>
+    <li>修改：{{ summary.modified }}</li>
+    <li>停用（不会自动复活，将被跳过）：{{ summary.disabled }}</li>
+  </ul>
+  <p class="muted">预览为零写入；取消不会更改任何资料。确认写入将在一个事务内完成；若参考资料在此期间已变化，确认会被拒绝并要求重新预览。</p>
+</section>
+
+{% macro machine_table(label, rows) %}
+{% if rows %}
+<section class="panel">
+  <h2>{{ label }}（{{ rows|length }}）</h2>
+  <table class="grid">
+    <thead><tr><th>机型</th><th>scope</th><th>英文品名</th><th>商品编码</th><th>申报要素</th><th>特殊</th>{% if label == '修改' %}<th>原申报要素</th>{% endif %}</tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td class="mono">{{ r.model }}</td>
+        <td class="mono">{{ r.destination_scope or 'default' }}</td>
+        <td>{{ r.english_name or '-' }}</td>
+        <td class="mono">{{ r.hs_code or '-' }}</td>
+        <td class="pre">{{ r.declaration or '-' }}</td>
+        <td>{{ r.special or '-' }}</td>
+        {% if label == '修改' %}<td class="pre">{{ r.previous.declaration if r.previous else '-' }}</td>{% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endmacro %}
+
+{{ machine_table('新增', new_rows) }}
+{{ machine_table('修改', modified_rows) }}
+{{ machine_table('停用（跳过）', disabled_rows) }}
+{{ machine_table('未变化', unchanged_rows) }}
+
+<section class="panel">
+  <form method="post" action="/references/machines/confirm" class="stack">
+    {% include "_csrf.html" %}
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit">确认写入</button>
+  </form>
+  <p><a class="button" href="/references">取消（不写入任何资料）</a></p>
+</section>
+{% else %}
+<p class="empty">没有待确认的导入预览。请到 <a href="/references">参考资料页</a> 上传机型库生成预览。</p>
+{% endif %}
+{% endblock %}

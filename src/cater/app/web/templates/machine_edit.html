@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}编辑机型 · CATER{% endblock %}
+{% block content %}
+<h1>编辑机型</h1>
+<p class="muted">机型键（规范化机型 + 目的国范围）为稳定键，编辑不会修改；如需变更请新增正确记录后停用旧记录。</p>
+
+<section class="panel">
+  <dl class="facts">
+    <dt>机型</dt><dd class="mono">{{ machine.model }}</dd>
+    <dt>规范化键</dt><dd class="mono">{{ machine.model_norm }}</dd>
+    <dt>目的国范围</dt><dd class="mono">{{ machine.destination_scope or "default" }}</dd>
+    <dt>来源</dt><dd>{{ machine.source or "-" }}</dd>
+  </dl>
+
+  <form method="post" action="/references/machines/{{ machine.model_norm }}/{{ machine.destination_scope or 'default' }}/edit" class="stack">
+    {% include "_csrf.html" %}
+    <div class="grid2">
+      <label>英文品名 <input type="text" name="english_name" value="{{ machine.english_name or '' }}" maxlength="120"></label>
+      <label>商品编码 <input type="text" name="hs_code" value="{{ machine.hs_code or '' }}" maxlength="20"></label>
+      <label>商品名称 <input type="text" name="product_name" value="{{ machine.product_name or '' }}" maxlength="120"></label>
+      <label>特殊标记 <input type="text" name="special" value="{{ machine.special or '' }}" maxlength="40"></label>
+      <label>核验备注 <input type="text" name="verification" value="{{ machine.verification or '' }}" maxlength="120"></label>
+      <label>备注 <input type="text" name="notes" value="{{ machine.notes or '' }}" maxlength="200"></label>
+    </div>
+    <label>申报要素 <textarea name="declaration" rows="3">{{ machine.declaration or '' }}</textarea></label>
+    <label class="checkall"><input type="checkbox" name="special_rule_confirmed" value="1" {% if machine.special_rule_confirmed %}checked{% endif %}> 特殊规则已确认（未确认请勿勾选，避免推广未确认规则）</label>
+    <label>修改原因 <input type="text" name="reason" maxlength="200" placeholder="用于审计，可留空"></label>
+    <button type="submit">保存修改</button>
+  </form>
+  <p><a class="button" href="/references#machines">返回参考资料</a></p>
+</section>
+{% endblock %}

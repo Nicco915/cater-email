@@ -127,7 +127,7 @@ def create_app(
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'none'; style-src 'self'; img-src 'self' data:; "
-            "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "script-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
         return response
 
@@ -228,27 +228,85 @@ def create_app(
         status = (request.query_params.get("status") or "").strip()
         kind = (request.query_params.get("kind") or "").strip()
         search = (request.query_params.get("search") or "").strip()
+        lifecycle = (request.query_params.get("lifecycle") or "active").strip()
+        if lifecycle not in {"active", "archived", "trashed", "all"}:
+            lifecycle = "active"
         try:
-            limit = max(1, min(int(request.query_params.get("limit") or 100), 500))
+            limit = max(1, min(int(request.query_params.get("limit") or 50), 500))
         except ValueError:
-            limit = 100
+            limit = 50
+        try:
+            page = max(1, int(request.query_params.get("page") or 1))
+        except ValueError:
+            page = 1
+        offset = (page - 1) * limit
         tasks = service.tasks.list(
             status=status or None,
             kind=kind or None,
             search=search or None,
+            lifecycle=lifecycle,
             limit=limit,
+            offset=offset,
         )
+        total_counts = service.tasks.lifecycle_counts()
+        total = total_counts.get(lifecycle, 0)
+        pages = max(1, (total + limit - 1) // limit)
         return render(
             request,
             "tasks.html",
             tasks=tasks,
             counts=service.tasks.counts(),
+            lifecycle_counts=total_counts,
             statuses=sorted(state.ALL_STATUSES),
             status=status,
             kind=kind,
             search=search,
+            lifecycle=lifecycle,
             limit=limit,
+            page=page,
+            pages=pages,
         )
+
+    @app.post("/tasks/batch")
+    async def task_batch(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        action = text(form, "action")
+        raw_ids = form.getlist("task_ids")
+        task_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        valid = {"archive", "unarchive", "delete", "restore"}
+        if action not in valid or not task_ids:
+            return flash_redirect(
+                "/", error="请选择任务并指定有效操作"
+            )
+        reason = text(form, "reason") or None
+        try:
+            if action == "archive":
+                service.batch_archive(task_ids, actor="web-admin", reason=reason)
+            elif action == "unarchive":
+                service.batch_unarchive(task_ids, actor="web-admin")
+            elif action == "delete":
+                service.batch_delete(task_ids, actor="web-admin", reason=reason)
+            else:
+                service.batch_restore(task_ids, actor="web-admin")
+        except CaterError as exc:
+            # BatchDisallowedError carries per-item reasons; show them so the
+            # operator can resolve each before retrying. Nothing was applied.
+            items = getattr(exc, "items", None)
+            if items:
+                detail = "；".join(f"{i['task_id']}：{i['reason']}" for i in items)
+                return flash_redirect("/", error=f"批量操作已撤销：{detail}")
+            return flash_redirect("/", error=f"{exc.code}: {exc}")
+        except Exception as exc:
+            service.logger.exception("web_batch_failed", exc, action=action)
+            return flash_redirect("/", error=f"{type(exc).__name__}: {exc}")
+        labels = {
+            "archive": "归档",
+            "unarchive": "取消归档",
+            "delete": "删除到回收站",
+            "restore": "从回收站恢复",
+        }
+        return flash_redirect("/", message=f"已{labels[action]} {len(task_ids)} 个任务")
 
     @app.get("/tasks/{task_id}", response_class=HTMLResponse)
     def task_detail(request: Request, task_id: str):
@@ -312,6 +370,77 @@ def create_app(
             f"/tasks/{task_id}",
             lambda: service.deliver_task(task_id, actor="web-admin"),
             success="已创建交付邮件",
+        )
+
+    @app.post("/tasks/{task_id}/archive")
+    async def task_archive(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        task_or_404(task_id)
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.archive_task(task_id, actor="web-admin", reason=text(form, "reason") or None),
+            success="任务已归档（仅隐藏，不影响处理与发信）",
+        )
+
+    @app.post("/tasks/{task_id}/unarchive")
+    async def task_unarchive(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        task_or_404(task_id)
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.unarchive_task(task_id, actor="web-admin"),
+            success="任务已取消归档",
+        )
+
+    @app.post("/tasks/{task_id}/delete")
+    async def task_delete(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        task_or_404(task_id)
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.delete_task(task_id, actor="web-admin", reason=text(form, "reason") or None),
+            success="任务已删除到回收站（暂停后续处理与发送，可恢复）",
+        )
+
+    @app.post("/tasks/{task_id}/restore")
+    async def task_restore(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        task_or_404(task_id)
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.restore_task(task_id, actor="web-admin"),
+            success="任务已从回收站恢复（未自动重发或重算，需显式操作）",
+        )
+
+    @app.get("/tasks/{task_id}/purge", response_class=HTMLResponse)
+    def task_purge_preview(request: Request, task_id: str):
+        try:
+            preview = service.purge_task_files_preview(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Task not found")
+        except CaterError as exc:
+            return flash_redirect(f"/tasks/{task_id}", error=f"{exc.code}: {exc}")
+        return render(request, "purge.html", purge=preview, task_id=task_id)
+
+    @app.post("/tasks/{task_id}/purge")
+    async def task_purge_confirm(request: Request, task_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        if not checked(form, "confirm"):
+            return flash_redirect(f"/tasks/{task_id}/purge", error="需勾选确认才能永久清理")
+        return run_action(
+            request,
+            f"/tasks/{task_id}",
+            lambda: service.purge_task_files(task_id, actor="web-admin"),
+            success="任务文件已永久清理（数据库摘要保留）",
         )
 
     # ------------------------------------------------------------------
@@ -440,12 +569,148 @@ def create_app(
     # ------------------------------------------------------------------
     @app.get("/references", response_class=HTMLResponse)
     def references_page(request: Request):
+        country_search = (request.query_params.get("country_search") or "").strip()
+        machine_search = (request.query_params.get("machine_search") or "").strip()
+
+        def paged(key: str) -> tuple[int, int]:
+            try:
+                page = max(1, int(request.query_params.get(key) or 1))
+            except ValueError:
+                page = 1
+            return page, page
+
+        per_page = 50
+        country_page, _ = paged("country_page")
+        machine_page, _ = paged("machine_page")
+        country_total = service.references.count_countries(
+            search=country_search or None
+        )
+        machine_total = service.references.count_machines(
+            search=machine_search or None
+        )
+        country_pages = max(1, (country_total + per_page - 1) // per_page)
+        machine_pages = max(1, (machine_total + per_page - 1) // per_page)
+        country_page = min(country_page, country_pages)
+        machine_page = min(machine_page, machine_pages)
         return render(
             request,
             "references.html",
-            countries=service.references.list_countries(),
+            countries=service.references.list_countries(
+                search=country_search or None,
+                limit=per_page,
+                offset=(country_page - 1) * per_page,
+            ),
             aliases=service.references.country_aliases(),
-            machines=service.references.list_machines(),
+            machines=service.references.list_machines(
+                search=machine_search or None,
+                limit=per_page,
+                offset=(machine_page - 1) * per_page,
+            ),
+            machine_aliases=service.references.list_machine_aliases(),
+            country_search=country_search,
+            machine_search=machine_search,
+            country_total=country_total,
+            machine_total=machine_total,
+            country_page=country_page,
+            machine_page=machine_page,
+            country_pages=country_pages,
+            machine_pages=machine_pages,
+            reference_version=service.references.reference_version(),
+            authoritative=True,
+        )
+
+    @app.get("/references/machines/{model_norm}/{destination_scope}/edit", response_class=HTMLResponse)
+    def references_machine_edit_page(request: Request, model_norm: str, destination_scope: str):
+        machine = service.references.get_machine(model_norm, destination_scope)
+        if machine is None:
+            raise HTTPException(status_code=404, detail="Machine not found")
+        return render(request, "machine_edit.html", machine=machine)
+
+    @app.post("/references/machines/{model_norm}/{destination_scope}/edit")
+    async def references_machine_edit(request: Request, model_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        # model_norm + destination_scope form the stable key and are never
+        # silently changed by the edit; only declaration/metadata are editable.
+        return run_action(
+            request,
+            f"/references/machines/{model_norm}/{destination_scope}/edit",
+            lambda: service.references.update_machine(
+                model_norm,
+                destination_scope,
+                english_name=text(form, "english_name"),
+                hs_code=text(form, "hs_code"),
+                product_name=text(form, "product_name"),
+                declaration=text(form, "declaration"),
+                notes=text(form, "notes"),
+                special=text(form, "special"),
+                verification=text(form, "verification"),
+                special_rule_confirmed=checked(form, "special_rule_confirmed"),
+                actor="web-admin",
+                reason=text(form, "reason") or "web edit",
+            ),
+            success="机型资料已更新并记录审计",
+        )
+
+    @app.post("/references/countries")
+    async def references_country_create(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        alpha3 = text(form, "alpha3")
+        name_zh = text(form, "name_zh")
+        name_en = text(form, "name_en")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.create_country(
+                alpha3, name_zh, name_en, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success=f"已新增国家 {alpha3.upper()}",
+        )
+
+    @app.post("/references/countries/{alpha3}")
+    async def references_country_update(request: Request, alpha3: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.update_country(
+                alpha3,
+                name_zh=text(form, "name_zh") or None,
+                name_en=text(form, "name_en") or None,
+                actor="web-admin",
+                reason=text(form, "reason") or None,
+            ),
+            success=f"已更新国家 {alpha3.upper()}",
+        )
+
+    @app.post("/references/countries/{alpha3}/enabled")
+    async def references_country_enabled(request: Request, alpha3: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        enabled = checked(form, "enabled")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.set_country_enabled(
+                alpha3, enabled, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success=f"国家 {alpha3.upper()} 已{'启用' if enabled else '停用'}",
+        )
+
+    @app.post("/references/countries/{alpha3}/delete")
+    async def references_country_delete(request: Request, alpha3: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        force = checked(form, "force")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.delete_country(
+                alpha3, actor="web-admin", reason=text(form, "reason") or None, force=force
+            ),
+            success=f"国家 {alpha3.upper()} 已{'物理删除' if force else '停用'}",
         )
 
     @app.post("/references/alias")
@@ -461,6 +726,192 @@ def create_app(
                 alias, alpha3, actor="web-admin", reason="web admin"
             ),
             success=f"已添加国家别名 {alias} → {alpha3}",
+        )
+
+    @app.post("/references/aliases/{alias_norm}/delete")
+    async def references_alias_delete(request: Request, alias_norm: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.delete_alias(
+                alias_norm, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success="已删除国家别名",
+        )
+
+    @app.post("/references/machines")
+    async def references_machine_create(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.create_machine(
+                text(form, "model"),
+                text(form, "destination_scope"),
+                english_name=text(form, "english_name") or None,
+                hs_code=text(form, "hs_code") or None,
+                product_name=text(form, "product_name") or None,
+                declaration=text(form, "declaration") or None,
+                notes=text(form, "notes") or None,
+                special=text(form, "special") or None,
+                verification=text(form, "verification") or None,
+                special_rule_confirmed=checked(form, "special_rule_confirmed"),
+                actor="web-admin",
+                reason=text(form, "reason") or None,
+            ),
+            success="已新增机型记录",
+        )
+
+    @app.post("/references/machines/{model_norm}/{destination_scope}/enabled")
+    async def references_machine_enabled(request: Request, model_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        enabled = checked(form, "enabled")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.set_machine_enabled(
+                model_norm, destination_scope, enabled, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success=f"机型已{'启用' if enabled else '停用'}",
+        )
+
+    @app.post("/references/machines/{model_norm}/{destination_scope}/delete")
+    async def references_machine_delete(request: Request, model_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        force = checked(form, "force")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.delete_machine(
+                model_norm, destination_scope, actor="web-admin",
+                reason=text(form, "reason") or None, force=force,
+            ),
+            success=f"机型已{'物理删除' if force else '停用'}",
+        )
+
+    @app.post("/references/aliases/{alias_norm}/enabled")
+    async def references_alias_enabled(request: Request, alias_norm: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        enabled = checked(form, "enabled")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.set_alias_enabled(
+                alias_norm, enabled, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success=f"国家别名已{'启用' if enabled else '停用'}",
+        )
+
+    @app.post("/references/aliases/{alias_norm}/edit")
+    async def references_alias_edit(request: Request, alias_norm: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.update_country_alias(
+                alias_norm, text(form, "alias"), actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success="国家别名已更新",
+        )
+
+    @app.post("/references/machine-aliases")
+    async def references_machine_alias_add(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.add_machine_alias(
+                text(form, "model"),
+                text(form, "alias"),
+                text(form, "destination_scope"),
+                actor="web-admin",
+                reason=text(form, "reason") or None,
+            ),
+            success="已新增机型别名",
+        )
+
+    @app.post("/references/machine-aliases/{alias_norm}/{destination_scope}/edit")
+    async def references_machine_alias_edit(request: Request, alias_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.update_machine_alias(
+                alias_norm, destination_scope, text(form, "alias"),
+                actor="web-admin", reason=text(form, "reason") or None,
+            ),
+            success="机型别名已更新",
+        )
+
+    @app.post("/references/machine-aliases/{alias_norm}/{destination_scope}/enabled")
+    async def references_machine_alias_enabled(request: Request, alias_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        enabled = checked(form, "enabled")
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.set_machine_alias_enabled(
+                alias_norm, destination_scope, enabled,
+                actor="web-admin", reason=text(form, "reason") or None,
+            ),
+            success=f"机型别名已{'启用' if enabled else '停用'}",
+        )
+
+    @app.post("/references/machine-aliases/{alias_norm}/{destination_scope}/delete")
+    async def references_machine_alias_delete(request: Request, alias_norm: str, destination_scope: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.delete_machine_alias(
+                alias_norm, destination_scope, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success="已删除机型别名",
+        )
+
+    @app.post("/references/batch")
+    async def references_batch(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        resource = text(form, "resource")
+        enabled = checked(form, "enabled")
+        if resource == "country":
+            keys = [{"alpha3": v} for v in form.getlist("country_alpha3")]
+        elif resource == "machine":
+            raw = form.getlist("machine_key")
+            keys = []
+            for item in raw:
+                parts = str(item).split("|", 1)
+                if len(parts) == 2:
+                    keys.append({"model": parts[0], "destination_scope": parts[1]})
+        elif resource == "country_alias":
+            keys = [{"alias_norm": v} for v in form.getlist("country_alias_key")]
+        elif resource == "machine_alias":
+            keys = []
+            for item in form.getlist("machine_alias_key"):
+                parts = str(item).split("|", 1)
+                if len(parts) == 2:
+                    keys.append({"alias_norm": parts[0], "destination_scope": parts[1]})
+        else:
+            keys = []
+        return run_action(
+            request,
+            "/references",
+            lambda: service.references.batch_set_enabled(
+                resource, keys, enabled, actor="web-admin", reason=text(form, "reason") or None
+            ),
+            success=f"已{'启用' if enabled else '停用'} {len(keys)} 条资料",
         )
 
     @app.post("/references/machines/import")
@@ -487,11 +938,58 @@ def create_app(
             os.chmod(target, 0o600)
         except OSError:
             pass
+        # Preview only: nothing is written until the operator confirms on the
+        # preview page with a short-lived token bound to the reference version.
+        try:
+            preview = service.preview_machine_reference(str(target), actor="web-admin")
+        except CaterError as exc:
+            return flash_redirect("/references", error=f"{exc.code}: {exc}")
+        except Exception as exc:
+            service.logger.exception("web_import_preview_failed", exc)
+            return flash_redirect("/references", error=f"{type(exc).__name__}: {exc}")
+        params = {"token": preview["token"], "message": f"已生成预览：{preview['summary']}"}
+        return RedirectResponse(
+            f"/references/machines/preview?{urlencode(params)}", status_code=303
+        )
+
+    @app.get("/references/machines/preview", response_class=HTMLResponse)
+    def references_import_preview_page(request: Request):
+        token = (request.query_params.get("token") or "").strip()
+        if not token:
+            return render(request, "import_preview.html", preview=None)
+        preview = service.references.get_preview(token)
+        if preview is None:
+            return render(
+                request,
+                "import_preview.html",
+                preview=None,
+                error="预览不存在或已失效，请重新上传",
+            )
+        import json as _json
+        summary = _json.loads(str(preview["summary_json"]))
+        payload = _json.loads(str(preview["rows_json"]))
+        return render(
+            request,
+            "import_preview.html",
+            preview=preview,
+            summary=summary,
+            new_rows=payload.get("new", []) if isinstance(payload, dict) else [],
+            unchanged_rows=payload.get("unchanged", []) if isinstance(payload, dict) else [],
+            modified_rows=payload.get("modified", []) if isinstance(payload, dict) else [],
+            disabled_rows=payload.get("disabled", []) if isinstance(payload, dict) else [],
+            token=token,
+        )
+
+    @app.post("/references/machines/confirm")
+    async def references_import_confirm(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        token = text(form, "token")
         return run_action(
             request,
             "/references",
-            lambda: service.import_machine_reference(str(target), actor="web-admin"),
-            success="机型库导入完成",
+            lambda: service.confirm_machine_reference(token, actor="web-admin"),
+            success="机型库已按预览确认写入",
         )
 
     # ------------------------------------------------------------------
@@ -514,12 +1012,34 @@ def create_app(
                 key=lambda item: item["modified"],
                 reverse=True,
             )[:10]
+        poller_running = bool(poller is not None and poller.running)
         return render(
             request,
             "health.html",
             health=service.health(),
             recovery=service.recovery_report,
             backups=backups,
+            test_clear=service.clear_test_data_preview(poller_running=poller_running),
+        )
+
+    @app.post("/maintenance/clear-test")
+    async def maintenance_clear_test(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        if not checked(form, "confirm"):
+            return flash_redirect("/health", error="需勾选二次确认才能清空测试数据")
+        poller_running = bool(poller is not None and poller.running)
+        if poller_running:
+            return flash_redirect(
+                "/health", error="邮箱轮询仍在运行：请先停止轮询（--no-poll）后再清空测试数据"
+            )
+        return run_action(
+            request,
+            "/health",
+            lambda: service.clear_test_data(
+                actor="web-admin", confirm=True, poller_running=poller_running
+            ),
+            success="测试任务数据已清空（参考资料与配置保留，已先备份）",
         )
 
     @app.get("/api/health")

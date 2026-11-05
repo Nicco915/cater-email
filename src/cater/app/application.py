@@ -100,9 +100,12 @@ class AppService:
             retention_days=config.logging.retention_days,
         )
         self.db = Database(config.db_path)
-        self.references = ReferenceService(self.db, self.logger)
+        self.references = ReferenceService(
+            self.db, self.logger, tasks_dir=config.tasks_dir
+        )
         self.references.ensure_seeded()
         self.settings = SettingsService(self.db, self.logger, config)
+        self.record_environment_identity()
         self.tasks = TaskRepository(self.db, self.logger)
         self.mail_store = MailStore(self.db, config)
         self.outbox = OutboxRepository(self.db, self.logger)
@@ -156,6 +159,17 @@ class AppService:
     # ------------------------------------------------------------------
     # lifecycle / recovery
     # ------------------------------------------------------------------
+    def _require_active(self, task: dict[str, Any], action: str) -> None:
+        """Refuse processing-style actions on a trashed (recycle-bin) task.
+
+        Archive is display-only and never blocks anything; only deletion does.
+        Restoring a task is always allowed and is the explicit way back.
+        """
+
+        if task.get("deleted_at") is not None:
+            raise StateTransitionError(
+                f"任务 {task['id']} 已删除到回收站，不能{action}；请先从回收站恢复"
+            )
     def recover(self) -> dict[str, Any]:
         interrupted_tasks = self.tasks.recover_incomplete()
         uncertain_outbox = self.outbox.recover_sending()
@@ -362,6 +376,35 @@ class AppService:
         """Read-only status answer; never recalculates or changes the task."""
 
         task = self.tasks.require(task_id)
+        if task.get("deleted_at") is not None:
+            # A trashed task's status query is answered without revealing the
+            # task's prior state or any other task; the owner is told it can be
+            # recovered by asking maintenance.
+            body = (
+                f"{self._marker(task)} 任务状态查询\n\n"
+                "该任务已从列表删除并进入回收站，未发送任何新的结果或通知。\n"
+                "如需恢复处理，请联系维护人员从回收站恢复后再操作。\n"
+            )
+            mail = self.mail_store.get(mail_id)
+            recipient = normalize_email(str(mail.get("sender") or "")) if mail else None
+            if not recipient:
+                return
+            try:
+                row, _ = self.delivery.enqueue_guidance(
+                    recipient=recipient,
+                    recipient_name=mail.get("sender_name") if mail else None,
+                    subject=f"Re: {str(mail.get('subject') or '任务状态查询') if mail else '任务状态查询'}",
+                    body=body,
+                    in_reply_to=str(mail.get("message_id") or "") if mail else None,
+                    references=[str(mail["message_id"])] if mail and mail.get("message_id") else [],
+                    dedupe_key=f"status_deleted:{task_id}:{mail_id}",
+                )
+                self._dispatch_if_pending(row, actor="intake")
+            except Exception as exc:
+                self.logger.exception(
+                    "status_query_deleted_failed", exc, task_id=task_id
+                )
+            return
         open_issues = [
             issue for issue in self.tasks.issues(task_id) if issue["status"] == "open"
         ]
@@ -528,6 +571,7 @@ class AppService:
         explicit_reprocess: bool = False,
     ) -> dict[str, Any]:
         task = self.tasks.require(task_id)
+        self._require_active(task, "处理")
         status = str(task["status"])
         if status in {state.CANCELLED, state.SEND_UNKNOWN}:
             raise StateTransitionError(f"Task {task_id} is {status}; resolve it before processing")
@@ -1212,6 +1256,7 @@ class AppService:
     # ------------------------------------------------------------------
     def retry_task(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
         task = self.tasks.require(task_id)
+        self._require_active(task, "重试")
         if task["status"] not in {state.RETRY_PENDING, state.FAILED}:
             raise StateTransitionError("Only RETRY_PENDING or FAILED tasks can be retried")
         self.tasks.reset_retry_budget(task_id)
@@ -1221,6 +1266,7 @@ class AppService:
         self, task_id: str, *, actor: str = "admin", regenerate_only: bool = False
     ) -> dict[str, Any]:
         task = self.tasks.require(task_id)
+        self._require_active(task, "重新处理")
         if task["status"] in {state.PROCESSING, state.VALIDATING, state.SEND_UNKNOWN}:
             raise StateTransitionError(
                 f"Task {task_id} is {task['status']}; resolve it before reprocessing"
@@ -1253,6 +1299,7 @@ class AppService:
 
     def confirm_reprocess(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
         task = self.tasks.require(task_id)
+        self._require_active(task, "确认重新处理")
         if not any(
             issue["code"] == "REPROCESS_CONFIRMATION_REQUIRED" and issue["status"] == "open"
             for issue in self.tasks.issues(task_id)
@@ -1275,6 +1322,7 @@ class AppService:
         """
 
         task = self.tasks.require(task_id)
+        self._require_active(task, "交付")
         if task["status"] != state.READY_TO_SEND:
             raise StateTransitionError(
                 "Only READY_TO_SEND tasks can be delivered; reprocess or resolve first"
@@ -1299,6 +1347,378 @@ class AppService:
             detail={"outbox_id": row["id"], "version": version},
         )
         return self.tasks.require(task_id)
+
+    # ------------------------------------------------------------------
+    # task lifecycle (archive / recycle bin) and destructive maintenance
+    # ------------------------------------------------------------------
+    def archive_task(self, task_id: str, *, actor: str = "admin", reason: str | None = None) -> dict[str, Any]:
+        return self.tasks.archive(task_id, actor=actor, reason=reason)
+
+    def unarchive_task(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
+        return self.tasks.unarchive(task_id, actor=actor)
+
+    def delete_task(self, task_id: str, *, actor: str = "admin", reason: str | None = None) -> dict[str, Any]:
+        return self.tasks.delete_to_trash(task_id, actor=actor, reason=reason)
+
+    def restore_task(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
+        return self.tasks.restore_from_trash(task_id, actor=actor)
+
+    def batch_archive(self, task_ids: list[str], *, actor: str = "admin", reason: str | None = None) -> dict[str, Any]:
+        return self.tasks.batch_archive(task_ids, actor=actor, reason=reason)
+
+    def batch_unarchive(self, task_ids: list[str], *, actor: str = "admin") -> dict[str, Any]:
+        return self.tasks.batch_unarchive(task_ids, actor=actor)
+
+    def batch_delete(self, task_ids: list[str], *, actor: str = "admin", reason: str | None = None) -> dict[str, Any]:
+        return self.tasks.batch_delete(task_ids, actor=actor, reason=reason)
+
+    def batch_restore(self, task_ids: list[str], *, actor: str = "admin") -> dict[str, Any]:
+        return self.tasks.batch_restore(task_ids, actor=actor)
+
+    def purge_task_files_preview(self, task_id: str) -> dict[str, Any]:
+        """Preview what 'permanently purge task files' would remove.
+
+        Only trashed tasks in a terminal status (COMPLETED/CANCELLED/FAILED/
+        WAITING_INPUT/READY_TO_SEND) are eligible. SENT outbox rows with
+        unconfirmed delivery (SEND_UNKNOWN) are excluded — the operator must
+        resolve those first. Returns the file paths and sizes that would go,
+        plus what is deliberately kept (dedupe hashes, send summaries, audit).
+        """
+
+        task = self.tasks.require(task_id)
+        if task.get("deleted_at") is None:
+            raise ValidationError("只有已删除到回收站的任务才能永久清理文件")
+        if str(task["status"]) in {
+            state.PROCESSING,
+            state.VALIDATING,
+            state.SEND_UNKNOWN,
+            state.RECEIVED,
+            state.RETRY_PENDING,
+        }:
+            raise ValidationError(
+                "该任务尚未到达终态，不能永久清理文件；请等待处理结束或先核对发送结果"
+            )
+        uncertain = self.db.fetchone(
+            "SELECT 1 FROM outbox WHERE task_id = ? AND status = 'send_unknown' LIMIT 1",
+            (task_id,),
+        )
+        if uncertain is not None:
+            raise ValidationError("该任务有发送结果不确定的邮件，请先核对后再清理")
+        directory = (self.config.tasks_dir / task_id).resolve()
+        files: list[dict[str, Any]] = []
+        if directory.is_dir() and is_within(directory, self.config.tasks_dir.resolve()):
+            for path in sorted(directory.rglob("*")):
+                if path.is_file():
+                    files.append({"path": str(path), "size": path.stat().st_size})
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "file_count": len(files),
+            "files": files,
+            "kept": [
+                "任务记录与状态、业务去重指纹(content_hash/business_identity)",
+                "outbox 发送摘要与发送记录",
+                "task_events 审计与字段来源(field_provenance)",
+            ],
+            "note": "文件清理后无法恢复原始附件；数据库摘要保留以便去重与审计。",
+        }
+
+    def purge_task_files(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
+        """Permanently delete runtime files for a trashed terminal task.
+
+        Database rows (task, versions, outbox, events, provenance, issues) are
+        kept so dedupe and send summaries still work; only runtime files under
+        the task directory are removed. The original e-mail is never deleted
+        here — it may be referenced by other versions or tasks.
+        """
+
+        preview = self.purge_task_files_preview(task_id)
+        directory = (self.config.tasks_dir / task_id).resolve()
+        removed = 0
+        if directory.is_dir() and is_within(directory, self.config.tasks_dir.resolve()):
+            shutil.rmtree(directory)
+            removed = preview["file_count"]
+        self.db.insert(
+            """
+            INSERT INTO task_events (
+                task_id, version, stage, code, detail_json, actor, created_at
+            ) VALUES (?, 0, 'cleanup', 'task_files_purged', ?, ?, ?)
+            """,
+            (
+                task_id,
+                json.dumps({"files_removed": removed}, ensure_ascii=False),
+                actor,
+                utc_now(),
+            ),
+        )
+        self.logger.info("task_files_purged", task_id=task_id, actor=actor, files_removed=removed)
+        return {"task_id": task_id, "files_removed": removed}
+
+    # ------------------------------------------------------------------
+    # test-data clear (identity-proven, never on a production runtime)
+    # ------------------------------------------------------------------
+    def test_identity(self) -> str:
+        """The allowlist identity persisted at first initialization.
+
+        ``test``/``production``. Absent means the runtime predates the marker
+        and cannot be reliably identified, so test-clear must refuse.
+        """
+
+        from .runtime_meta import get_meta
+
+        return get_meta(self.db, "environment") or "unknown"
+
+    def record_environment_identity(self) -> None:
+        """Record a durable environment identity WITHOUT trusting mode alone.
+
+        Rules (restart-stable, never overwritten unsafely):
+
+        * Effective mode ``production`` -> identity ``production`` and a
+          permanent ``seen_production`` marker. Once seen, the DB can never be
+          treated as a clearable test runtime, even if the operator later
+          switches the mode back to ``test``.
+        * Otherwise (mode ``test``) and no identity recorded yet:
+          - if the database already holds tasks or mail (for example an old
+            production DB being upgraded), record ``unknown`` — never ``test``;
+          - only a genuinely empty runtime with mode ``test`` is recorded as
+            ``test``.
+
+        A prior ``production``/``unknown`` identity is never downgraded to
+        ``test``. Combined with the "stop the poller / no in-progress / no
+        unknown outbox" checks, this ensures test-clear cannot touch a
+        production or ambiguous runtime.
+        """
+
+        from .runtime_meta import get_meta, set_meta, set_meta_if_absent
+
+        effective_mode = self.settings.current().allowlist.mode
+        if effective_mode == "production":
+            set_meta_if_absent(self.db, "environment", "production")
+            set_meta(self.db, "seen_production", "1")
+            return
+        # mode == test (or anything non-production)
+        existing = get_meta(self.db, "environment")
+        if existing is not None:
+            return
+        has_data = int(self.db.scalar("SELECT COUNT(*) FROM tasks") or 0) > 0 or int(
+            self.db.scalar("SELECT COUNT(*) FROM mail_messages") or 0
+        ) > 0
+        identity = "unknown" if has_data else "test"
+        set_meta_if_absent(self.db, "environment", identity)
+        # Bind the identity to the canonical runtime directory so a test DB
+        # copied into another (for example production) runtime cannot be
+        # cleared there. Recorded once with the identity.
+        try:
+            set_meta_if_absent(
+                self.db,
+                "environment_runtime_dir",
+                str(self.config.paths.runtime_dir.resolve()),
+            )
+        except OSError:
+            pass
+
+    def _clear_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        active = self.db.scalar(
+            """
+            SELECT COUNT(*) FROM tasks
+             WHERE deleted_at IS NULL AND status IN (?, ?, ?, ?)
+            """,
+            (
+                state.PROCESSING,
+                state.VALIDATING,
+                state.SEND_UNKNOWN,
+                state.RETRY_PENDING,
+            ),
+        )
+        if int(active or 0):
+            blockers.append(f"存在 {int(active)} 个处理中/待重试任务")
+        inflight = self.db.scalar(
+            "SELECT COUNT(*) FROM outbox WHERE status IN ('sending', 'send_unknown')"
+        )
+        if int(inflight or 0):
+            blockers.append(f"存在 {int(inflight)} 封发送中/发送结果不确定的邮件（含无任务邮件）")
+        return blockers
+
+    def clear_test_data_preview(self, *, poller_running: bool = False) -> dict[str, Any]:
+        from .runtime_meta import get_meta
+
+        identity = self.test_identity()
+        current_mode = self.settings.current().allowlist.mode
+        if current_mode == "production":
+            # Real-time safety net: if the live mode is production, record the
+            # permanent marker now (covers direct/edge mode changes that bypassed
+            # the audited settings path) so a later switch back to test cannot
+            # make the runtime clearable.
+            from .runtime_meta import set_meta
+
+            set_meta(self.db, "seen_production", "1")
+        seen_production = get_meta(self.db, "seen_production")
+        recorded_dir = get_meta(self.db, "environment_runtime_dir")
+        try:
+            dir_ok = recorded_dir is None or recorded_dir == str(
+                self.config.paths.runtime_dir.resolve()
+            )
+        except OSError:
+            dir_ok = False
+        # Identity must be a durable ``test`` marker bound to this runtime
+        # directory, the effective mode must be test, and the runtime must never
+        # have run in production mode.
+        identity_ok = (
+            identity == "test"
+            and current_mode == "test"
+            and seen_production is None
+            and dir_ok
+        )
+        blockers = self._clear_blockers()
+        if poller_running:
+            blockers.append("邮箱轮询仍在运行，请先停止轮询")
+        return {
+            "eligible": identity_ok,
+            "identity": identity,
+            "current_mode": current_mode,
+            "seen_production": seen_production is not None,
+            "runtime_dir_ok": dir_ok,
+            "in_progress_tasks": int(
+                self.db.scalar(
+                    "SELECT COUNT(*) FROM tasks WHERE deleted_at IS NULL "
+                    "AND status IN (?, ?, ?, ?)",
+                    (
+                        state.PROCESSING,
+                        state.VALIDATING,
+                        state.SEND_UNKNOWN,
+                        state.RETRY_PENDING,
+                    ),
+                )
+                or 0
+            ),
+            "blockers": blockers,
+            "runtime_dir": str(self.config.paths.runtime_dir),
+            "removes": [
+                "tasks / task_versions / task_inputs / task_overrides",
+                "task_issues / field_provenance / task_artifacts / task_events",
+                "outbox 邮件记录（含无任务邮件）",
+                "mail_messages 与 runtime/mail 下按年月子目录保存的全部原始邮件",
+                "mailbox_cursors 游标（清理后下次运行将重新建立首轮水位）",
+                "runtime/tasks 任务目录文件",
+            ],
+            "keeps": [
+                "countries / country_aliases / machine_materials / machine_aliases 参考资料与别名",
+                "config_versions 审计与 runtime_meta 身份",
+                "backups / diagnostics / schema_migrations",
+            ],
+        }
+
+    def _remove_tree_children(self, root: Path) -> tuple[int, list[str]]:
+        """Remove every child under ``root`` recursively; return (count, errors).
+
+        File removal is checked: errors are returned so the caller can refuse to
+        report success. Nothing outside ``root`` (verified via is_within) is
+        touched.
+        """
+
+        removed = 0
+        errors: list[str] = []
+        if not root.is_dir():
+            return 0, []
+        root_resolved = root.resolve()
+        for child in root_resolved.iterdir():
+            if not is_within(child, root_resolved):
+                errors.append(f"拒绝越界路径：{child}")
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                removed += 1
+            except OSError as exc:
+                errors.append(f"{child}: {exc}")
+        return removed, errors
+
+    def clear_test_data(
+        self,
+        *,
+        actor: str = "admin",
+        confirm: bool = False,
+        poller_running: bool = False,
+    ) -> dict[str, Any]:
+        """Clear test task data after proving the runtime is a test identity.
+
+        Requires a durable ``test`` identity (never a production/unknown one),
+        effective mode ``test``, never-seen-production, explicit confirmation, a
+        fresh backup, no in-progress tasks, no sending/unknown outbox, and the
+        poller stopped. Files are removed first and any file-removal failure
+        aborts before the database is touched, so a successful return means the
+        files really were cleared. Reference data and configuration are kept.
+        """
+
+        preview = self.clear_test_data_preview(poller_running=poller_running)
+        if not preview["eligible"]:
+            raise ValidationError(
+                "无法可靠判定当前运行目录为测试身份（初始化身份="
+                f"{preview['identity']}，当前模式={preview['current_mode']}，"
+                f"曾用于生产={preview['seen_production']}），拒绝清空以保护生产数据"
+            )
+        if not confirm:
+            raise ValidationError("清空测试数据需要显式二次确认")
+        if preview["blockers"]:
+            raise ValidationError("清空受阻：" + "；".join(preview["blockers"]))
+
+        safety = self.maintenance.backup("pre-test-clear")
+        # Remove files FIRST; if any removal fails, abort before deleting rows so
+        # we never claim success while originals remain (or vice versa).
+        tasks_removed, task_errors = self._remove_tree_children(self.config.tasks_dir)
+        mail_removed, mail_errors = self._remove_tree_children(self.config.mail_dir)
+        errors = task_errors + mail_errors
+        if errors:
+            raise ValidationError(
+                "文件清理失败，数据库未改动：" + "；".join(errors[:5])
+            )
+        with self.db.transaction() as conn:
+            for table in (
+                "task_artifacts",
+                "field_provenance",
+                "task_issues",
+                "task_overrides",
+                "task_inputs",
+                "task_events",
+                "outbox",
+                "task_versions",
+                "tasks",
+                "mail_messages",
+                "mailbox_cursors",
+            ):
+                conn.execute(f"DELETE FROM {table}")
+        self.logger.warning(
+            "test_data_cleared",
+            actor=actor,
+            safety_backup=str(safety),
+            task_paths_removed=tasks_removed,
+            mail_paths_removed=mail_removed,
+        )
+        return {
+            "safety_backup": str(safety),
+            "task_paths_removed": tasks_removed,
+            "mail_paths_removed": mail_removed,
+            "note": "首轮水位将在下次扫描时重新建立；历史补扫策略不变。",
+        }
+
+    # ------------------------------------------------------------------
+    # machine reference import: preview then confirm (web flow)
+    # ------------------------------------------------------------------
+    def preview_machine_reference(self, path: str, *, actor: str = "admin") -> dict[str, Any]:
+        importer = self._reference_importer or load_import_machine_reference()
+        rows = importer(path)
+        if not isinstance(rows, list):
+            raise ValidationError("import_machine_reference must return a list")
+        filename = Path(path).name
+        return self.references.preview_machine_import(
+            rows, filename=filename, source_path=path, actor=actor
+        )
+
+    def confirm_machine_reference(self, token: str, *, actor: str = "admin") -> dict[str, Any]:
+        return self.references.confirm_machine_import(token, actor=actor)
 
     def retry_pending_tasks(self, *, limit: int = 10, actor: str = "admin") -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []

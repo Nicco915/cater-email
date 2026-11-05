@@ -494,8 +494,56 @@ def cmd_add_country_alias(args: argparse.Namespace) -> int:
 
 def cmd_import_machines(args: argparse.Namespace) -> int:
     with _service(args) as service:
+        if args.confirm:
+            result = service.confirm_machine_reference(args.confirm, actor="cli")
+            print(json.dumps(result, ensure_ascii=False, default=_json_default))
+            return 0
+        if args.preview:
+            preview = service.preview_machine_reference(args.path, actor="cli")
+            print(json.dumps(preview, ensure_ascii=False, default=_json_default))
+            return 0
         result = service.import_machine_reference(args.path, actor="cli")
     print(json.dumps(result, ensure_ascii=False, default=_json_default))
+    return 0
+
+
+def cmd_task_lifecycle(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        action = args.lifecycle_command
+        if action == "archive":
+            task = service.archive_task(args.task_id, actor="cli", reason=args.reason)
+        elif action == "unarchive":
+            task = service.unarchive_task(args.task_id, actor="cli")
+        elif action == "delete":
+            task = service.delete_task(args.task_id, actor="cli", reason=args.reason)
+        elif action == "restore":
+            task = service.restore_task(args.task_id, actor="cli")
+        else:
+            raise ValidationError(action)
+    print(f"{task['id']} -> {task['status']}")
+    return 0
+
+
+def cmd_purge_files(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        if not args.yes:
+            preview = service.purge_task_files_preview(args.task_id)
+            _emit_json(preview)
+            print("Add --yes to permanently delete the listed files.", file=sys.stderr)
+            return 1
+        result = service.purge_task_files(args.task_id, actor="cli")
+    _emit_json(result)
+    return 0
+
+
+def cmd_clear_test(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        if not args.yes:
+            _emit_json(service.clear_test_data_preview())
+            print("Add --yes to clear test data after reviewing the preview.", file=sys.stderr)
+            return 1
+        result = service.clear_test_data(actor="cli", confirm=True)
+    _emit_json(result)
     return 0
 
 
@@ -698,7 +746,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason")
 
     p = command("import-machines", cmd_import_machines, "Import Sheet1 machine references via core")
-    p.add_argument("path")
+    p.add_argument("path", nargs="?", help="xlsx path (for direct import or --preview)")
+    p.add_argument("--preview", action="store_true", help="Preview the import without writing")
+    p.add_argument("--confirm", metavar="TOKEN", help="Confirm a previewed import by token")
+
+    p = command("task-lifecycle", cmd_task_lifecycle, "Archive/delete/restore a task")
+    lifecycle_sub = p.add_subparsers(dest="lifecycle_command", required=True)
+    for action_name in ["archive", "unarchive", "delete", "restore"]:
+        sub = lifecycle_sub.add_parser(action_name)
+        _add_globals(sub, suppress=True)
+        sub.add_argument("task_id")
+        sub.add_argument("--reason")
+        sub.set_defaults(handler=cmd_task_lifecycle)
+
+    p = command("purge-files", cmd_purge_files, "Permanently purge files of a trashed terminal task")
+    p.add_argument("task_id")
+    p.add_argument("--yes", action="store_true")
+
+    p = command("clear-test", cmd_clear_test, "Clear test task data (test identity required)")
+    p.add_argument("--yes", action="store_true")
 
     p = command("backup", cmd_backup, "Create and verify a consistent SQLite backup")
     p.add_argument("--reason", default="manual")

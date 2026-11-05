@@ -135,7 +135,10 @@ def process_job(request: dict) -> dict:
         os.environ.get("CATER_OUTPUT_DIR", tempfile_get()), task_id or "job")
     overrides = request.get("overrides", []) or []
 
-    country_index = CountryIndex(references.get("countries"))
+    country_index = CountryIndex(
+        references.get("countries"),
+        authoritative=bool(references.get("authoritative")),
+    )
     machine_index = MachineIndex(references.get("machines"),
                                  references.get("machine_aliases"))
 
