@@ -23,10 +23,10 @@ from .models import FieldValue, Issue, Source
 from .parsing.headers import merged_aliases, normalize_header
 from .parsing.mail_html import parse_mail_html, parse_mail_text
 from .parsing.machine_wb import (INVOICE_NAME_KEYS, PACKING_NAME_KEYS,
-                                 parse_machine_workbook)
+                                 parse_machine_workbook, sniff_machine_workbook)
 from .parsing.parts import parse_parts_workbook
-from .parsing.workbook import (SUPPORTED_SUFFIXES,
-                             UnsupportedSourceError, load_workbook_pair)
+from .parsing.workbook import (SUPPORTED_SUFFIXES, UnsupportedSourceError,
+                               WorkbookDependencyError, load_workbook_pair)
 from .reconcile import reconcile_machines
 from .references import CountryIndex, MachineIndex
 from .template_writer import (MACHINE_COMM_SPEC, MACHINE_MATERIALS_SPEC,
@@ -58,32 +58,59 @@ def _content_hash(kind: str, destination: Optional[dict], records: list) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def _workbook_sheet_keys(path: str) -> Optional[list]:
-    """统一只读接口取 sheet 名列表（规范化小写键）；无法读取返回 None。"""
+def _probe_workbook(path: str) -> tuple[Optional[list], Optional[Exception]]:
+    """探测工作簿可读性与 sheet 键；区分“读不了”和“读得到但没有业务表”。
+
+    返回 (规范化 sheet 键列表, 读取错误)。错误保留有限信息：
+    WorkbookDependencyError = 运行环境缺依赖（部署问题，附件本身有效）；
+    UnsupportedSourceError = 格式不支持/损坏/加密（输入问题）。
+    """
     if not str(path).lower().endswith(SUPPORTED_SUFFIXES):
-        return None
+        return None, UnsupportedSourceError(
+            f"不支持的附件格式：{Path(str(path)).name}（仅支持 .xlsx 与 .xls）")
     try:
         wb, _ = load_workbook_pair(path)
         names = [normalize_header(n) for n in wb.sheetnames]
         if hasattr(wb, "close"):
             wb.close()
-        return names
-    except UnsupportedSourceError:
-        return None
-    except Exception:
-        return None
+        return names, None
+    except Exception as exc:
+        return None, exc
 
 
-def _classify(sources: list, mail: dict) -> str:
-    """kind=auto 时的业务识别：配件看 CI-For Dealer 表，整机看业务表别名或机器信息表。"""
+def _workbook_sheet_keys(path: str) -> Optional[list]:
+    """统一只读接口取 sheet 名列表（规范化小写键）；无法读取返回 None。"""
+    names, _error = _probe_workbook(path)
+    return names
+
+
+def _classify(sources: list, mail: dict, aliases=None) -> str:
+    """kind=auto 时的业务识别：配件看 CI-For Dealer 表，整机看业务表别名、
+    机器信息表/重量表结构（sheet 重命名也可识别）。
+
+    至少一个附件因环境缺依赖（WorkbookDependencyError）读不了时，返回
+    内部哨兵 "dependency_blocked"，由 process_job 暴露真实依赖错误，
+    而不是笼统报“无法识别业务类型”把部署问题吞掉。"""
+    dependency_blocked = False
     for src in sources:
-        names = _workbook_sheet_keys(src.get("path", ""))
+        names, error = _probe_workbook(src.get("path", ""))
+        if isinstance(error, WorkbookDependencyError):
+            dependency_blocked = True
         if names and any(n.startswith("cifordealer") for n in names):
             return "parts"
     for src in sources:
-        names = _workbook_sheet_keys(src.get("path", ""))
+        names, _error = _probe_workbook(src.get("path", ""))
         if names and (INVOICE_NAME_KEYS & set(names) or PACKING_NAME_KEYS & set(names)):
             return "machine"
+    for src in sources:
+        names, _error = _probe_workbook(src.get("path", ""))
+        if names is not None:
+            # 名称未命中但结构命中（已确认的布局灵活性：业务表可重命名）；
+            # 结构探测使用调用方配置的别名（与解析阶段同一套）。
+            if sniff_machine_workbook(src.get("path", ""), aliases):
+                return "machine"
+    if dependency_blocked:
+        return "dependency_blocked"
     if (mail or {}).get("html") or (mail or {}).get("text"):
         return "machine"
     return "unsupported"
@@ -219,7 +246,25 @@ def process_job(request: dict) -> dict:
                             required_action="请通过管理页解决机型资料冲突"))
 
     if kind == "auto":
-        kind = _classify(sources, mail)
+        kind = _classify(sources, mail, header_aliases)
+    if kind == "dependency_blocked":
+        # 分类未完成是因为运行环境缺依赖（如 xlrd）：暴露真实依赖错误，
+        # 而不是笼统报“无法识别业务类型”。附件本身有效，无需重发。
+        for src in sources:
+            _names, error = _probe_workbook(src.get("path", ""))
+            if not isinstance(error, WorkbookDependencyError):
+                continue
+            filename = src.get("filename") or Path(str(src.get("path", ""))).name
+            issues.append(Issue(
+                code="WORKBOOK_DEPENDENCY",
+                message=f"附件 {filename} 已收到，但运行环境缺少解析所需组件："
+                        f"{error}",
+                sources=[Source(type="workbook", filename=filename)],
+                required_action="附件无需重发；请联系维护人员在运行环境"
+                                "安装缺失组件后重试本任务",
+            ))
+        return _build_response("waiting_input", "unsupported", [], issues, [], [],
+                               None, _content_hash("unsupported", destination, []))
     if kind not in ("parts", "machine"):
         return _build_response(
             "unsupported", "unsupported", [],
@@ -242,47 +287,129 @@ def tempfile_get() -> str:
     return tempfile.gettempdir()
 
 
-def _pick_workbook(sources: list, want: str, issues: list):
-    """从 sources 中挑选含目标工作表的 xlsx/xls；返回 (path, filename) 或 (None, None)。"""
-    matches = []
+def _pick_workbook(sources: list, want: str, issues: list,
+                   aliases=None) -> tuple[Optional[str], Optional[str], str]:
+    """从 sources 中挑选目标工作簿；返回 (path, filename, state)。
+
+    state ∈ {"picked", "absent", "unreadable", "unrecognized", "ambiguous"}：
+    - absent：未附任何工作簿（由调用方登记 MISSING_SOURCE）；
+    - unreadable：附件在但读不了——依赖缺失（WORKBOOK_DEPENDENCY，指向
+      维护人员）或格式损坏/不支持（UNSUPPORTED_FILE，指向重发修正件）；
+    - unrecognized：可读但其中没有目标业务表（UNSUPPORTED_FILE，
+      “未找到…工作表”，与“缺少附件”区分）；
+    - ambiguous：多个附件都符合（AMBIGUOUS_INPUT，绝不同时报缺少附件）。
+
+    整机挑选先按业务表名（Invoice/CI/Packing list/PL），再对每一个名称未
+    命中但可读的附件做结构探测（已确认的布局灵活性，sheet 可重命名）：结构
+    命中的与名称命中的同为候选，一起参与内容去重与歧义判定。读得到但不认识
+    的保持 conservative：不猜测、不静默忽略，归入 unrecognized 暂停。
+    """
+    matches: list[dict] = []
+    readable_unmatched: list[dict] = []
+    unreadable: list[tuple[dict, Exception]] = []
     for src in sources:
-        names = _workbook_sheet_keys(src.get("path", ""))
+        names, error = _probe_workbook(src.get("path", ""))
+        if error is not None:
+            unreadable.append((src, error))
+            continue
         if names is None:
             continue
         if want == "parts" and any(n.startswith("cifordealer") for n in names):
             matches.append(src)
-        if want == "machine" and (INVOICE_NAME_KEYS & set(names)
-                                  or PACKING_NAME_KEYS & set(names)):
+        elif want == "machine" and (INVOICE_NAME_KEYS & set(names)
+                                    or PACKING_NAME_KEYS & set(names)):
             matches.append(src)
+        else:
+            readable_unmatched.append(src)
+    if want == "machine":
+        # 逐个结构探测名称未命中的可读附件（多附件同样探测，不能只挑一个
+        # 或整体跳过）：重命名后的合格附件必须与名称命中的附件一起参与
+        # 去重/歧义判定，不得静默忽略第二候选。
+        for candidate in readable_unmatched:
+            if sniff_machine_workbook(candidate.get("path", ""), aliases):
+                matches.append(candidate)
+    # 相同字节内容（同名再传或换名再传）只算一个候选：保留全部输入
+    # 记录（审计/来源不变），但处理与歧义判定按内容去重。
+    distinct: dict[str, dict] = {}
+    for src in matches:
+        try:
+            digest = hashlib.sha256(Path(str(src["path"])).read_bytes()).hexdigest()
+        except OSError:
+            digest = f"unreadable:{src.get('path')}"
+        distinct.setdefault(digest, src)
+    matches = list(distinct.values())
     if len(matches) > 1:
         issues.append(Issue(
             code="AMBIGUOUS_INPUT",
             message=f"多个附件都包含目标工作表：{[m.get('filename') for m in matches]}",
-            required_action="请确认应使用的附件",
+            required_action="多份内容不同的附件都符合本票要求，无法自动选定；"
+                            "本次未采用任何一份，已保存的附件不会被删除或改动。"
+                            "请联系维护人员确认应使用的附件后再继续本任务",
         ))
-        return None, None
+        return None, None, "ambiguous"
     if matches:
-        return matches[0].get("path"), matches[0].get("filename") or Path(matches[0]["path"]).name
-    return None, None
+        src = matches[0]
+        return (src.get("path"),
+                src.get("filename") or Path(src["path"]).name,
+                "picked")
+    if not sources:
+        return None, None, "absent"
+    for src, error in unreadable:
+        filename = src.get("filename") or Path(str(src.get("path", ""))).name
+        if isinstance(error, WorkbookDependencyError):
+            issues.append(Issue(
+                code="WORKBOOK_DEPENDENCY",
+                message=f"附件 {filename} 已收到，但运行环境缺少解析所需组件："
+                        f"{error}",
+                sources=[Source(type="workbook", filename=filename)],
+                required_action="附件无需重发；请联系维护人员在运行环境"
+                                "安装缺失组件后重试本任务",
+            ))
+        elif isinstance(error, UnsupportedSourceError):
+            issues.append(Issue(
+                code="UNSUPPORTED_FILE",
+                message=f"附件 {filename} 无法读取：{error}",
+                sources=[Source(type="workbook", filename=filename)],
+                required_action="请补充未加密、未损坏的 xlsx 或 xls 附件后重发",
+            ))
+        else:  # 未知读取错误：保留有限信息，不吞成“缺少附件”
+            issues.append(Issue(
+                code="UNSUPPORTED_FILE",
+                message=f"附件 {filename} 读取失败：{type(error).__name__}",
+                sources=[Source(type="workbook", filename=filename)],
+                required_action="请补充未加密、未损坏的 xlsx 或 xls 附件后重发",
+            ))
+    if readable_unmatched:
+        filenames = [m.get("filename") or Path(str(m.get("path", ""))).name
+                     for m in readable_unmatched]
+        hint = ("配件发票工作簿（CI-For Dealer）" if want == "parts"
+                else "整机发票/箱单工作表（Invoice/CI/Packing list/PL，"
+                     "或机器信息表/重量表结构）")
+        issues.append(Issue(
+            code="UNSUPPORTED_FILE",
+            message=f"附件 {filenames} 已读取，但未找到{hint}",
+            sources=[Source(type="workbook", filename=f) for f in filenames],
+            required_action="请确认附件为正确的业务工作簿后重发",
+        ))
+        return None, None, "unrecognized"
+    if unreadable:
+        return None, None, "unreadable"
+    return None, None, "absent"
 
 
 def _process_parts(task_id, destination, sources, country_index,
                    output_dir, overrides, issues, header_aliases,
                    raw_aliases=None) -> dict:
-    path, filename = _pick_workbook(sources, "parts", issues)
+    path, filename, pick_state = _pick_workbook(sources, "parts", issues,
+                                                aliases=header_aliases)
     if path is None:
-        if not any(i.code == "AMBIGUOUS_INPUT" for i in issues):
-            # 检查是否存在不支持的附件
-            if sources:
-                issues.append(Issue(
-                    code="UNSUPPORTED_FILE",
-                    message="附件中未找到配件发票工作簿（CI-For Dealer）",
-                    required_action="请补充含 CI-For Dealer (2) 的 xlsx 或 xls 附件"))
-            else:
-                issues.append(Issue(
-                    code="MISSING_SOURCE",
-                    message="缺少配件发票附件",
-                    required_action="请补充配件发票 xlsx 或 xls 附件"))
+        # absent：未附任何工作簿；其余状态（unreadable/unrecognized/
+        # ambiguous）已由挑选阶段登记具体问题，不再笼统报“缺少附件”。
+        if pick_state == "absent":
+            issues.append(Issue(
+                code="MISSING_SOURCE",
+                message="缺少配件发票附件",
+                required_action="请补充配件发票 xlsx 或 xls 附件"))
         return _build_response("waiting_input", "parts", [], issues, [], [],
                                None, _content_hash("parts", destination, []))
     try:
@@ -343,23 +470,45 @@ def _process_parts(task_id, destination, sources, country_index,
 def _process_machine(task_id, destination, sources, mail, country_index,
                      machine_index, output_dir, overrides, issues,
                      header_aliases, raw_aliases=None) -> dict:
-    path, filename = _pick_workbook(sources, "machine", issues)
+    path, filename, pick_state = _pick_workbook(sources, "machine", issues,
+                                                aliases=header_aliases)
     wb_result = None
     if path is not None:
         try:
             wb_result = parse_machine_workbook(path, filename,
                                                aliases=header_aliases)
+        except WorkbookDependencyError as exc:
+            issues.append(Issue(
+                code="WORKBOOK_DEPENDENCY",
+                message=f"附件 {filename} 已收到，但运行环境缺少解析所需组件："
+                        f"{exc}",
+                sources=[Source(type="workbook", filename=filename)],
+                required_action="附件无需重发；请联系维护人员在运行环境"
+                                "安装缺失组件后重试本任务",
+            ))
+            return _build_response("waiting_input", "machine", [], issues,
+                                   [], [], None,
+                                   _content_hash("machine", destination, []))
         except UnsupportedSourceError as exc:
             return _build_response("unsupported", "machine", [],
                                    [Issue(code="UNSUPPORTED_FILE", message=str(exc),
                                           required_action="请补充 xlsx 或 xls 格式附件")],
                                    [], [], None, _content_hash("machine", destination, []))
         issues.extend(wb_result.issues)
-    else:
+    elif pick_state == "absent":
+        # 仅在确实未附工作簿时才报缺少附件；附件在但读不了/不匹配/多附件
+        # 已由挑选阶段登记具体问题（WORKBOOK_DEPENDENCY/UNSUPPORTED_FILE/
+        # AMBIGUOUS_INPUT），不得再误报“缺少附件”。
         issues.append(Issue(
             code="MISSING_SOURCE",
             message="缺少整机发票箱单附件，净重、序列号等无法取得",
             required_action="请补充 Invoice+Packing list（或 CI/PL）xlsx 或 xls 附件"))
+    elif pick_state == "ambiguous":
+        # 多份内容不同的附件都符合：整票暂停，只报告歧义本身（候选文件名
+        # 与解决方式已由挑选阶段写入）。附件未定稿前不解析邮件、不对账，
+        # 避免误导性的“缺字段/缺附件/请修正数值”提示。
+        return _build_response("waiting_input", "machine", [], issues, [], [],
+                               None, _content_hash("machine", destination, []))
 
     mail_result = None
     if mail.get("html"):

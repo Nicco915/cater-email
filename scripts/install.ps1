@@ -55,6 +55,12 @@ Invoke-CaterNative `
     -Description "Installing CATER in editable mode" `
     -FilePath $Python `
     -Arguments @("-m", "pip", "install", "-e", ".[dev]")
+# Explicit runtime dependency check: a missing xlrd must fail the install
+# loudly instead of surfacing later as a false "missing attachment" on .xls.
+Invoke-CaterNative `
+    -Description "Verifying .xls parsing dependency (xlrd)" `
+    -FilePath $Python `
+    -Arguments @("-c", "import xlrd")
 
 if (-not (Test-Path "config\config.toml")) {
     Copy-Item "config\config.example.toml" "config\config.toml"

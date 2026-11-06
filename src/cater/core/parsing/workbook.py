@@ -36,6 +36,14 @@ class UnsupportedSourceError(Exception):
     """无法作为工作簿解析（格式不支持、损坏、加密或超出安全限制）。"""
 
 
+class WorkbookDependencyError(Exception):
+    """运行环境缺少解析依赖（如 xlrd）：这是部署/运行时问题，不是输入缺失。
+
+    与 UnsupportedSourceError 区分：附件本身已收到且可能完全有效，
+    错误动作应指向维护人员安装依赖，而不是让发件人重发附件。
+    """
+
+
 # ----------------------------------------------------------------------
 # xls (BIFF) wrapper
 # ----------------------------------------------------------------------
@@ -89,9 +97,10 @@ class _XlsWorkbook:
     def __init__(self, path: str) -> None:
         try:
             import xlrd
-        except ImportError as exc:  # pragma: no cover - 依赖缺失即配置错误
-            raise UnsupportedSourceError(
-                "解析 .xls 附件需要 xlrd 依赖，请安装 xlrd 后重试") from exc
+        except ImportError as exc:
+            raise WorkbookDependencyError(
+                "解析 .xls 附件需要 xlrd 依赖，但当前运行环境未安装"
+            ) from exc
         try:
             self._book = xlrd.open_workbook(path, on_demand=True)
         except Exception as exc:

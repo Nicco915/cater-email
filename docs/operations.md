@@ -36,6 +36,8 @@ PowerShell -ExecutionPolicy Bypass -File scripts\install.ps1
 
 > **原生命令退出码。** `scripts\install.ps1` 通过 `scripts\native.ps1` 统一检查 `py -3 -m venv`、`pip install`、`cli init` 等每一步的 `$LASTEXITCODE`；任一步非零都会立即抛错并以非零码退出，不会在失败后继续打印 `Installed`。`run-web.ps1`、`run-poller.ps1` 在服务异常退出时返回实际退出码，`backup.ps1` 备份失败也会抛错。上述 PowerShell 脚本只做了静态检查和 helper 逻辑测试，**尚未在真实 Windows PowerShell 5.1 / 任务计划程序上实机验收**。
 
+> **依赖变更后必须重装一次 editable。** 代码更新若引入或升级运行依赖（例如真正 BIFF `.xls` 解析所需的 `xlrd`），拉取代码后需在仓库根目录执行一次性 `.venv\Scripts\python.exe -m pip install -e .`（或重跑 `scripts\install.ps1`，它会显式校验 `import xlrd`，缺失时安装直接报错而不是带病运行）。`cli health` 输出中的 `xls_dependency_installed` 为 `false` 即表示当前环境缺 `.xls` 解析依赖，此时 `.xls` 任务会报 `WORKBOOK_DEPENDENCY` 而不是误报“缺少附件”。
+
 手动安装等价步骤：
 
 ```powershell
@@ -297,6 +299,19 @@ PowerShell -ExecutionPolicy Bypass -File scripts\register-tasks.ps1 -Remove
 - 旧版本和旧输出保留；管理操作始终作用于当前版本。
 - `deliver` 只对 `READY_TO_SEND` 有效；dry-run 时只标记 `dry_run`。
 - 后台轮询每轮会发送到期的发件箱、重试可重试任务并执行每日维护。
+
+两个与附件有关的问题代码需要区分处理：
+
+- `WORKBOOK_DEPENDENCY`（运行环境缺解析组件，如 `xlrd`）：这是部署问题，
+  不是发件人缺附件——追问正文会明确写“附件无需重发”。维护人员在运行环境
+  执行一次性 `.venv\Scripts\python.exe -m pip install -e .` 补齐依赖后，直接
+  `retry task_xxxxxxxx`（或等待轮询自动重试）即可：附件已保存，不删除、不改动，
+  无需对方重新发送，任务从当前版本继续。
+- `AMBIGUOUS_INPUT`（多份内容不同的附件都符合本票要求）：整票暂停，追问正文
+  列出候选文件名，本次未采用任何一份，已保存附件不会被删除或改动。请维护人员
+  确认应使用的附件后继续本任务；若要更换其中一份，由发起人沿用原附件名重发该
+  文件即可（同名替换只作用于新版本，旧版本输入行与文件保留审计）。
+  内容完全相同的重复附件（同名或换名）只算一个来源候选，不会触发本问题代码。
 
 ### 6.1 补件格式（只接受明确结构化指令）
 

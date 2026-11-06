@@ -1009,6 +1009,14 @@ class IntakeService:
             for item in self.tasks.inputs(task_id, version)
             if item.get("source_type") != "offline_original"
         ]
+        # 内容判重覆盖本任务全部已存附件（含离线原始件）：相同字节再次上传
+        # （同名或换名）等价于已保存附件，不产生第二个候选、不阻塞；既有
+        # 输入行与来源审计原样保留。
+        existing_hashes = {
+            str(item.get("file_hash"))
+            for item in self.tasks.inputs(task_id, version)
+            if item.get("file_hash")
+        }
         groups: dict[str, list[ParsedAttachment]] = {}
         for item in attachments:
             groups.setdefault(normalize_filename(item.filename), []).append(item)
@@ -1030,9 +1038,13 @@ class IntakeService:
                 )
         replaced: set[str] = set()
         unmatched: list[str] = []
+        duplicate_names: set[str] = set()
         for name, group in groups.items():
             if any(normalize_filename(str(item["filename"])) == name for item in inputs):
                 replaced.add(name)
+            elif all(str(item.sha256) in existing_hashes for item in group):
+                # 与已保存附件字节完全一致：不视为新附件，不阻塞不换名
+                duplicate_names.add(name)
             else:
                 unmatched.append(group[0].filename)
         if unmatched:
@@ -1084,6 +1096,9 @@ class IntakeService:
         try:
             staging.mkdir(parents=True, exist_ok=True)
             for item in attachments:
+                if normalize_filename(item.filename) in duplicate_names:
+                    # 与已保存附件完全相同：不落盘、不加输入行；已存附件即唯一候选
+                    continue
                 stored = stored_filename(item.sha256, item.filename)
                 target = staging / safe_filename(stored)
                 temporary = target.with_name(target.name + ".tmp")

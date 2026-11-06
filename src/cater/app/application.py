@@ -81,6 +81,13 @@ class PollReport:
 
 
 
+def _xls_dependency_installed() -> bool:
+    """运行环境是否具备 .xls 解析依赖（xlrd）。布尔值，不暴露环境细节。"""
+    import importlib.util
+
+    return importlib.util.find_spec("xlrd") is not None
+
+
 def _semantic_tables(layout: dict) -> dict:
     """按语义角色归并结构表（不按 sheet 名）：sheet 重命名、增删表
     都会被差异对比发现。"""
@@ -432,6 +439,9 @@ class AppService:
             "imap_host_configured": bool(self.config.mail.imap_host),
             "smtp_host_configured": bool(self.config.mail.smtp_host),
             "account_configured": bool(self.config.mail.account),
+            # 显式依赖检查：.xls 解析需要 xlrd；缺失时 health 可见，
+            # 避免 .xls 附件被误报为“缺少附件”（部署问题 ≠ 输入缺失）。
+            "xls_dependency_installed": _xls_dependency_installed(),
             # Booleans only: never render secret values.
             "credential_presence": credentials,
         }

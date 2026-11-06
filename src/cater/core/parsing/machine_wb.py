@@ -265,6 +265,30 @@ def _text_net_weight(ws) -> Optional[Decimal]:
     return None
 
 
+def sniff_machine_workbook(path: str, aliases=None) -> bool:
+    """结构探测：工作簿内是否存在可解析的机器信息表或箱单重量表。
+
+    与 sheet 名无关（已确认的布局灵活性：业务表可重命名）。用于附件
+    挑选/分类的名称未命中回退；探测不解析明细、不产生副作用。
+    """
+    try:
+        wb_values, _wb_formula = load_workbook_pair(path)
+    except Exception:
+        return False
+    aliases = aliases or merged_aliases(None)
+    for name in wb_values.sheetnames:
+        ws = wb_values[name]
+        _resolution, error = _find_machine_table(ws, aliases)
+        if error is None:
+            return True
+        weight = resolve_columns(ws, WEIGHT_FIELDS, aliases,
+                                 require=WEIGHT_REQUIRE)
+        if (weight.header_row and not weight.missing
+                and not weight.ambiguous and not weight.multiple_regions):
+            return True
+    return False
+
+
 def parse_machine_workbook(path: str, filename: str, aliases=None) -> MachineWorkbookResult:
     result = MachineWorkbookResult()
     aliases = aliases or merged_aliases(None)

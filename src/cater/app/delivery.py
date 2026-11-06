@@ -153,6 +153,10 @@ _STRUCTURE_GUIDANCE = {
     "MISSING_SOURCE": ("未收到所需的 Excel 附件", None),
     "UNSUPPORTED_FILE": ("附件无法使用（不是有效的 xlsx/xls、文件已加密，"
                          "或不含所需工作表）", None),
+    "WORKBOOK_DEPENDENCY": ("附件已收到，但运行环境缺少解析该 Excel 所需的组件"
+                            "（如 xlrd）", None),
+    "AMBIGUOUS_INPUT": ("多份内容不同的附件都符合本票要求，无法自动选定，"
+                        "本次未采用任何一份（已保存附件不会被删除或改动）", None),
 }
 _QUIET_SUBJECT_RE = None
 
