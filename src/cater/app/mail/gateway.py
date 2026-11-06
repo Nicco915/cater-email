@@ -97,6 +97,71 @@ def encode_imap_mailbox(name: str) -> str:
     return "".join(result).replace('"', '\\"')
 
 
+# ---------------------------------------------------------------------------
+# RFC 2971 client identification (163-style dedicated mailboxes)
+# ---------------------------------------------------------------------------
+
+# Static, truthful client metadata only: never the account, credentials or
+# any personal/business data.
+IMAP_ID_METADATA = (("name", "CATER"), ("version", "1.0"))
+
+
+def _advertises_id(capabilities) -> bool:
+    """Capabilities may be pre-split atoms, full capability lines or None."""
+    if not capabilities:
+        return False
+    for item in capabilities:
+        if isinstance(item, (bytes, bytearray)):
+            atoms = bytes(item).split()
+        elif isinstance(item, str):
+            atoms = item.split()
+        else:
+            continue
+        for atom in atoms:
+            if isinstance(atom, bytes):
+                if atom.split(b"=", 1)[0].upper() == b"ID":
+                    return True
+            elif atom.split("=", 1)[0].upper() == "ID":
+                return True
+    return False
+
+
+def _bounded_server_text(data, limit: int = 160) -> str:
+    """Server diagnostic text: decoded, control chars stripped, length bounded.
+
+    Used so operators can distinguish e.g. an 'Unsafe Login' policy rejection
+    from a nonexistent folder, without dumping protocol logs or raw mail.
+    """
+    if data is None:
+        return ""
+    if isinstance(data, (bytes, bytearray)):
+        chunks = [bytes(data)]
+    elif isinstance(data, str):
+        chunks = [data.encode("utf-8", "replace")]
+    else:
+        chunks = [bytes(item) for item in data if isinstance(item, (bytes, bytearray))]
+    if not chunks:
+        return ""
+    text = b" ".join(chunks).decode("utf-8", "replace")
+    text = "".join(ch for ch in text if ch >= " " and ch != "\x7f")
+    return " ".join(text.split())[:limit]
+
+
+def _send_rfc2971_id(connection: imaplib.IMAP4):
+    """Send the RFC 2971 ID command without mutating imaplib's command table.
+
+    CPython's imaplib looks up commands in the module-global ``Commands``
+    dict inside ``_command``, so registering ``ID`` on the instance (or the
+    class) would not take effect; the command line is therefore sent
+    directly through the connection's tag machinery.
+    """
+    pairs = " ".join(f'"{key}" "{value}"' for key, value in IMAP_ID_METADATA)
+    line = f"ID ({pairs})".encode("ascii")
+    tag = connection._new_tag()
+    connection.send(tag + b" " + line + imaplib.CRLF)
+    return connection._command_complete("ID", tag)
+
+
 class ImapGateway:
     def __init__(
         self,
@@ -127,20 +192,79 @@ class ImapGateway:
         except (OSError, ssl.SSLError, imaplib.IMAP4.error) as exc:
             raise MailTransportError(f"IMAP connection failed: {exc}") from exc
 
+    def _post_login_handshake(self, connection: imaplib.IMAP4) -> None:
+        """RFC 2971 ID handshake after LOGIN, before any folder access.
+
+        163-style dedicated mailboxes reject SELECT/EXAMINE ('Unsafe Login')
+        unless the client identifies itself via ID. Servers that never
+        advertise ID are untouched (Feishu etc.). A server that advertises
+        ID but rejects the command is a hard failure — never silently
+        proceed, because folder access would fail with a misleading error.
+        """
+        if connection.state != "AUTH":
+            return
+        advertised = _advertises_id(getattr(connection, "capabilities", None))
+        if not advertised:
+            # 登录后能力集可能变化：部分服务器仅在 AUTH 态通告 ID。
+            try:
+                status, data = connection.capability()
+            except imaplib.IMAP4.error:
+                status, data = "NO", None
+            if status == "OK":
+                advertised = _advertises_id(data)
+        if not advertised:
+            return
+        try:
+            status, data = _send_rfc2971_id(connection)
+        except (imaplib.IMAP4.error, OSError) as exc:
+            raise MailTransportError(
+                "IMAP server requires the RFC 2971 ID handshake, but the ID "
+                f"command failed: {_bounded_server_text(str(exc)) or exc}"
+            ) from exc
+        if status != "OK":
+            detail = _bounded_server_text(data)
+            raise MailTransportError(
+                "IMAP server requires the RFC 2971 ID handshake, but rejected "
+                f"the ID command{': ' + detail if detail else ''}"
+            )
+
+    def _login(self, connection: imaplib.IMAP4, account: str) -> None:
+        """Authenticate exactly once per connection, then run the ID handshake."""
+        try:
+            connection.login(account, self.credentials.imap_password(account) or "")
+        except imaplib.IMAP4.error as exc:
+            raise MailAuthError(f"IMAP authentication failed: {exc}") from exc
+        self._post_login_handshake(connection)
+
     def _select(self, connection: imaplib.IMAP4, folder: str) -> tuple[int | None, int]:
         try:
             status, data = connection.select(f'"{encode_imap_mailbox(folder)}"', readonly=True)
         except imaplib.IMAP4.error as exc:
-            raise MailTransportError(f"Cannot open mail folder: {exc}") from exc
+            raise MailTransportError(
+                f"Cannot open mail folder {folder!r}: "
+                f"{_bounded_server_text(str(exc)) or exc}"
+            ) from exc
         if status != "OK":
-            raise MailTransportError("Cannot open mail folder")
+            # 保留服务器诊断文本（限长去控制符），使 “Unsafe Login” 策略拒绝
+            # 与“文件夹不存在”可区分；不做协议级 debug 记录。
+            detail = _bounded_server_text(data)
+            raise MailTransportError(
+                f"Cannot open mail folder {folder!r}{': ' + detail if detail else ''}"
+            )
         uidvalidity: int | None = None
-        for item in data or []:
-            if isinstance(item, bytes):
-                match = re.search(rb"\[UIDVALIDITY\s+(\d+)\]", item)
-                if match:
-                    uidvalidity = int(match.group(1))
-                    break
+        # imaplib 把 tagged OK 里的 [UIDVALIDITY n] 收进 untagged_responses；
+        # select() 返回的 data 只是 EXISTS 计数，从中解析不到。
+        for item in (connection.untagged_responses.get("UIDVALIDITY") or []):
+            if isinstance(item, bytes) and item.strip().isdigit():
+                uidvalidity = int(item.strip())
+                break
+        if uidvalidity is None:
+            for item in data or []:
+                if isinstance(item, bytes):
+                    match = re.search(rb"\[UIDVALIDITY\s+(\d+)\]", item)
+                    if match:
+                        uidvalidity = int(match.group(1))
+                        break
         try:
             status, result = connection.status(
                 f'"{encode_imap_mailbox(folder)}"', "(UIDNEXT MESSAGES)"
@@ -178,10 +302,7 @@ class ImapGateway:
     ) -> ScanResult:
         connection = self._connection()
         try:
-            try:
-                connection.login(account, self.credentials.imap_password(account) or "")
-            except imaplib.IMAP4.error as exc:
-                raise MailAuthError(f"IMAP authentication failed: {exc}") from exc
+            self._login(connection, account)
             selected_validity, _ = self._select(connection, folder)
             changed = (
                 uid_validity is not None
@@ -253,19 +374,26 @@ class ImapGateway:
     def find_sent(self, account: str, sent_folder: str, message_id: str) -> bool:
         connection = self._connection()
         try:
-            try:
-                connection.login(account, self.credentials.imap_password(account) or "")
-            except imaplib.IMAP4.error as exc:
-                raise MailAuthError(f"IMAP authentication failed: {exc}") from exc
-            status, _ = connection.select(f'"{encode_imap_mailbox(sent_folder)}"', readonly=True)
+            self._login(connection, account)
+            status, data = connection.select(
+                f'"{encode_imap_mailbox(sent_folder)}"', readonly=True
+            )
             if status != "OK":
-                raise MailTransportError(f"Sent folder is unavailable: {sent_folder}")
+                detail = _bounded_server_text(data)
+                raise MailTransportError(
+                    f"Sent folder is unavailable: {sent_folder}"
+                    f"{': ' + detail if detail else ''}"
+                )
             header = message_id.strip()
             if not header.startswith("<"):
                 header = f"<{header}>"
             status, data = connection.uid("SEARCH", None, "HEADER", "Message-ID", header)
             if status != "OK":
-                raise MailTransportError("Sent-mail search failed")
+                detail = _bounded_server_text(data)
+                raise MailTransportError(
+                    "Sent-mail search failed"
+                    f"{': ' + detail if detail else ''}"
+                )
             return bool(data and data[0] and bytes(data[0]).strip())
         finally:
             try:

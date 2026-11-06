@@ -71,6 +71,30 @@ first_run_new_only = true
 - 电脑休眠恢复后会按已保存游标补取邮件。
 - 附件/邮件大小上限是保护阈值；超限会留下明确问题，不会静默截断业务字段。
 
+### 3.1.1 163 企业邮箱（专用邮箱）与 IMAP ID 握手
+
+163 系专用邮箱（如 dedicated163 账号）在 LOGIN 成功后、未发送 IMAP
+`ID`（RFC 2971）命令时，会拒绝 `SELECT/EXAMINE INBOX`（返回 `Unsafe
+Login`）。本应用的处理（自动、无需配置）：
+
+- **握手时机**：每次 IMAP 登录成功后、访问任何文件夹之前；`scan`（INBOX
+  收取）与 `find_sent`（已发送核对）两条路径一致，每连接一次，不重复登录。
+- **能力探测**：服务器通告 `ID` 能力才握手；不通告的服务器（如飞书）完全
+  不受影响。登录后能力集可能变化，必要时自动重查一次 CAPABILITY。
+- **客户端元数据**：仅发送静态真实信息 `name=CATER`、`version=1.0`；绝不
+  携带账号、密码或任何个人/业务数据。
+- **失败即停**：服务器通告 ID 但拒绝该命令（NO/BAD/断连）时明确报错，不
+  静默继续——否则后续 SELECT 只会得到误导性的 “Unsafe Login”。
+- **诊断**：SELECT/EXAMINE 失败时错误信息保留服务器返回的限长文本（去控
+  制字符、截断），可区分 “Unsafe Login. Please contact kefu@…” 之类的
+  策略拒绝与 “Mailbox doesn't exist” 之类的文件夹不存在；不记录协议级
+  debug 日志或原始邮件内容。
+- **INBOX 与已发送文件夹**：收件箱即配置项 `folder = "INBOX"`；已发送核对
+  使用 `sent_folder`（默认 `Sent`，可在网页/设置中核对实际文件夹名）。
+- **UID 游标不变**：握手不改变 UID 游标建立与补取语义；首次运行仍默认
+  只建立游标（`first_run_new_only = true`），不会自动导入历史邮件；
+  `poll --history` 仍需人工显式执行。
+
 ### 3.2 允许名单（同时控制接入与发信）
 
 ```toml
