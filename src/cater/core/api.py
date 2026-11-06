@@ -21,7 +21,8 @@ import openpyxl
 
 from .models import FieldValue, Issue, Source
 from .parsing.headers import merged_aliases, normalize_header
-from .parsing.mail_html import parse_mail_html, parse_mail_text
+from .parsing.mail_html import (MAIL_DEFAULT_ALIASES, check_alias_collisions,
+                                mail_aliases, parse_mail_html, parse_mail_text)
 from .parsing.machine_wb import (INVOICE_NAME_KEYS, PACKING_NAME_KEYS,
                                  parse_machine_workbook, sniff_machine_workbook)
 from .parsing.parts import parse_parts_workbook
@@ -229,6 +230,17 @@ def process_job(request: dict) -> dict:
         os.environ.get("CATER_OUTPUT_DIR", tempfile_get()), task_id or "job")
     overrides = request.get("overrides", []) or []
     header_aliases = merged_aliases(request.get("header_aliases"))
+    # 邮件别名与工作簿别名是两个命名空间（同一归一键可各归各的语义字
+    # 段），冲突检测只在邮件别名内部做。
+    alias_conflicts = check_alias_collisions(
+        mail_aliases(), scope=set(MAIL_DEFAULT_ALIASES))
+    if alias_conflicts:
+        return _build_response(
+            "waiting_input", "unsupported", [],
+            [Issue(code="ALIAS_CONFIG_CONFLICT", message="；".join(alias_conflicts),
+                   required_action="请维护人员修正 [core.header_aliases] 中映射"
+                                   "到多个字段的同名别名后重试")],
+            [], [], None, _content_hash("unsupported", destination, []))
 
     country_index = CountryIndex(
         references.get("countries"),
@@ -279,7 +291,9 @@ def process_job(request: dict) -> dict:
                               request.get("header_aliases"))
     return _process_machine(task_id, destination, sources, mail, country_index,
                             machine_index, output_dir, overrides, issues,
-                            header_aliases, request.get("header_aliases"))
+                            header_aliases, request.get("header_aliases"),
+                            supplement_mails=request.get("supplement_mails"),
+                            supplement_mail=request.get("supplement_mail"))
 
 
 def tempfile_get() -> str:
@@ -469,7 +483,8 @@ def _process_parts(task_id, destination, sources, country_index,
 
 def _process_machine(task_id, destination, sources, mail, country_index,
                      machine_index, output_dir, overrides, issues,
-                     header_aliases, raw_aliases=None) -> dict:
+                     header_aliases, raw_aliases=None,
+                     supplement_mails=None, supplement_mail=None) -> dict:
     path, filename, pick_state = _pick_workbook(sources, "machine", issues,
                                                 aliases=header_aliases)
     wb_result = None
@@ -512,24 +527,74 @@ def _process_machine(task_id, destination, sources, mail, country_index,
 
     mail_result = None
     if mail.get("html"):
-        mail_result = parse_mail_html(mail["html"], mail.get("message_id"))
+        mail_result = parse_mail_html(mail["html"], mail.get("message_id"),
+                                      aliases=header_aliases)
     elif mail.get("text"):
-        mail_result = parse_mail_text(mail["text"], mail.get("message_id"))
-    if mail_result is not None:
-        issues.extend(mail_result.issues)
+        mail_result = parse_mail_text(mail["text"], mail.get("message_id"),
+                                      aliases=header_aliases)
     mail_rows = mail_result.rows if mail_result else []
-    if not mail_rows and (mail_result is None or mail_result.tables_seen == 0):
+
+    # 补件邮件业务表（当前版本累积的补充来源邮件，非引用历史）：与原始
+    # 邮件表在 reconcile 中按 MSO 显式合并（填充缺失/一致去重/冲突暂停带
+    # 溯源）。多封按接收顺序依次合并；只影响其 MSO 对应的记录。
+    supplement_rows: list = []
+    supplement_payloads = []
+    if supplement_mail:
+        supplement_payloads.append(supplement_mail)
+    supplement_payloads.extend(supplement_mails or [])
+    for supplement_payload in supplement_payloads:
+        supplement_result = None
+        if supplement_payload.get("html"):
+            supplement_result = parse_mail_html(
+                supplement_payload["html"], supplement_payload.get("message_id"),
+                aliases=header_aliases)
+        elif supplement_payload.get("text"):
+            supplement_result = parse_mail_text(
+                supplement_payload["text"], supplement_payload.get("message_id"),
+                aliases=header_aliases)
+        if supplement_result is not None:
+            issues.extend(supplement_result.issues)
+            supplement_rows.extend(supplement_result.rows)
+
+    # 原始业务表结构不可用（多列歧义/多版不一致/合并单元格越界）时，若
+    # 存在干净的补件完整业务表，则显式按补件表继续，而不是永远卡在原始
+    # 表的结构问题上：原始表的结构问题留痕（非阻断）后剔除其行，缺失字段
+    # 仍由 reconcile 的 MISSING_FIELD 如实暂停。原始表与补件表都给出真实
+    # 值时仍走 FIELD_CONFLICT，绝不静默覆盖。
+    if mail_result is not None:
+        structural = {"AMBIGUOUS_COLUMN", "MULTIPLE_BUSINESS_TABLES",
+                      "TABLE_STRUCTURE_INVALID"}
+        blocking_structural = [i for i in mail_result.issues
+                               if i.code in structural and i.blocking]
+        if blocking_structural and not mail_rows and supplement_rows:
+            issues.append(Issue(
+                code="TABLE_SUPERSEDED",
+                message="原始邮件业务表结构无法使用，已按补件回复的完整业务表继续",
+                sources=[i.sources[0] for i in blocking_structural if i.sources],
+                required_action="",
+                blocking=False,
+            ))
+            issues.extend(i for i in mail_result.issues
+                          if i not in blocking_structural)
+        else:
+            issues.extend(mail_result.issues)
+
+    if not mail_rows and not supplement_rows and (
+            mail_result is None or mail_result.tables_seen == 0):
         issues.append(Issue(
             code="MISSING_SOURCE",
-            message="邮件正文未解析到业务表（Cust. Purch. Order (MSO#)），Dealer/价格等无法取得",
-            required_action="请补充包含业务表的邮件正文"))
+            message="邮件正文未解析到业务表（含 Cust. Purch. Order/MSO 列），"
+                    "Dealer/价格等无法取得",
+            required_action="请回复包含完整业务表的邮件正文（HTML 表格或以 Tab/"
+                            "空格明确分列的文本，保留表头与 MSO 列）"))
 
     invoice_rows = wb_result.invoice_rows if wb_result else []
     packing_rows = wb_result.packing_rows if wb_result else []
     weight_groups = wb_result.weight_groups if wb_result else []
 
     rec_result = reconcile_machines(mail_rows, invoice_rows, packing_rows,
-                                    weight_groups, machine_index=machine_index)
+                                    weight_groups, machine_index=machine_index,
+                                    supplement_rows=supplement_rows)
     issues.extend(rec_result.issues)
 
     record_map = {r.mso: r.fields for r in rec_result.records}

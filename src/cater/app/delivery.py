@@ -157,6 +157,10 @@ _STRUCTURE_GUIDANCE = {
                             "（如 xlrd）", None),
     "AMBIGUOUS_INPUT": ("多份内容不同的附件都符合本票要求，无法自动选定，"
                         "本次未采用任何一份（已保存附件不会被删除或改动）", None),
+    "AMBIGUOUS_COLUMN": ("业务表同一字段对应多列（或同一行列值不一致），无法确定应使用哪一份取值",
+                         None),
+    "UNKNOWN_MAIL_HEADER": ("业务表存在暂无法识别的表头列（已识别列不受影响，照常处理）",
+                            None),
 }
 _QUIET_SUBJECT_RE = None
 
@@ -280,12 +284,14 @@ class DeliveryService:
                 fields = [item.strip() for item in field.split(",") if item.strip()]
                 names = "、".join(FIELD_LABELS.get(item, "业务信息") for item in fields) or "业务信息"
                 lines.append(f"- {prefix}缺少{names}，请补充。")
-                if record and fields:
+                if issue.get("required_action"):
+                    # 核心给出的动作优先（如整机：粘贴含表头与 MSO 列的
+                    # 完整业务表），不另附逐条 修正： 示例误导操作者。
+                    lines.append(f"  {issue['required_action']}")
+                elif record and fields:
                     for name in fields:
                         value = "4" if name == "qty" else "请填写正确值"
                         examples.append(f"修正：{record}.{name}={value}")
-                elif issue.get("required_action"):
-                    lines.append(f"  {issue['required_action']}")
                 else:
                     lines.append("  请联系处理人员核对该项资料，再按提示补充。")
             elif code == "FIELD_CONFLICT":

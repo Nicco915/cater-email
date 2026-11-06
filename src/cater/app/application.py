@@ -1330,6 +1330,24 @@ class AppService:
                         "text": parsed.text_body,
                         "message_id": parsed.message_id,
                     }
+        # 当前版本累积的全部补件业务表来源邮件（table-only 补件由 intake
+        # 记录到 task_version_mails，并随版本继承）：与原始邮件分开传入
+        # 核心，由核心按 MSO 显式合并（填充缺失/一致去重/冲突暂停带溯源），
+        # quoted 历史由核心解析器剔除。多封按接收顺序依次合并。
+        supplement_payloads: list[dict[str, Any]] = []
+        for link in self.tasks.version_mails(task_id, version, "supplement_table"):
+            record = self.mail_store.get(str(link["mail_id"]))
+            if not record or not record.get("raw_path"):
+                continue
+            supplement_path = Path(str(record["raw_path"]))
+            if not supplement_path.is_file():
+                continue
+            supplement_parsed = parse_mail(supplement_path.read_bytes())
+            supplement_payloads.append({
+                "html": supplement_parsed.html_body,
+                "text": supplement_parsed.text_body,
+                "message_id": supplement_parsed.message_id,
+            })
 
         sources: list[dict[str, Any]] = []
         seen: set[Path] = set()
@@ -1379,6 +1397,8 @@ class AppService:
             "output_dir": str(output_dir),
             "overrides": overrides,
         }
+        if supplement_payloads:
+            request["supplement_mails"] = supplement_payloads
         # 表头别名随请求快照持久化：同版本重试不依赖当前配置状态；
         # 别名是解析配置而非秘密，进入版本快照便于追溯。
         if self.config.core.header_aliases:
@@ -1957,6 +1977,7 @@ class AppService:
                 "task_overrides",
                 "task_inputs",
                 "task_events",
+                "task_version_mails",
                 "outbox",
                 "task_versions",
                 "tasks",

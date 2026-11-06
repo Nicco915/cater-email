@@ -34,6 +34,21 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _copy_version_mails(conn, task_id: str, old_version: int,
+                        new_version: int, now: str) -> None:
+    """版本来源邮件链接随版本继承：新版本保留之前积累的全部来源
+    （连续部分表格补件填充的字段才不会丢）。与输入行同一事务。"""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO task_version_mails (task_id, version, mail_id, role, created_at)
+        SELECT task_id, ?, mail_id, role, created_at
+          FROM task_version_mails
+         WHERE task_id = ? AND version = ?
+        """,
+        (new_version, task_id, old_version),
+    )
+
+
 class TaskRepository:
     def __init__(self, db: Database, logger: JsonlLogger) -> None:
         self.db = db
@@ -595,6 +610,7 @@ class TaskRepository:
                 """,
                 (task_id, new_version, row["status"], now),
             )
+            _copy_version_mails(conn, task_id, old_version, new_version, now)
             conn.execute(
                 """
                 UPDATE tasks SET version = ?, updated_at = ?,
@@ -705,6 +721,7 @@ class TaskRepository:
         destination: tuple[str, str] | None = None,
         overrides: Iterable[dict[str, Any]] = (),
         inputs: Iterable[dict[str, Any]] = (),
+        version_mails: Iterable[tuple[str, str]] = (),
     ) -> dict[str, Any]:
         """Apply a full owner supplement in ONE database transaction.
 
@@ -714,7 +731,10 @@ class TaskRepository:
         anything fails, the transaction rolls back: the previously active
         version, its inputs and the reference configuration remain exactly
         as they were. ``aliases`` items are pre-validated
-        ``(alias_norm, alias_raw, alpha3)`` tuples.
+        ``(alias_norm, alias_raw, alpha3)`` tuples. ``version_mails`` items
+        are ``(mail_id, role)`` marking which mail supplied this version's
+        business table (e.g. ``("...", "supplement_table")``) — audit only,
+        never changes data by itself.
         """
 
         excluded = {normalize_key(name) for name in exclude_filenames}
@@ -762,6 +782,7 @@ class TaskRepository:
                 """,
                 (task_id, new_version, row["status"], now),
             )
+            _copy_version_mails(conn, task_id, old_version, new_version, now)
             conn.execute(
                 """
                 UPDATE tasks SET version = ?, updated_at = ?,
@@ -853,6 +874,16 @@ class TaskRepository:
                         int(item.get("size_bytes") or 0),
                         now,
                     ),
+                )
+            for mail_id, role in version_mails:
+                # 累积：同版本可有多封表格补件（各提供部分字段），全部保留
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO task_version_mails (
+                        task_id, version, mail_id, role, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (task_id, new_version, mail_id, role, now),
                 )
             conn.execute(
                 """
@@ -979,6 +1010,21 @@ class TaskRepository:
             dict(row)
             for row in self.db.fetchall(
                 "SELECT * FROM task_overrides WHERE task_id = ? ORDER BY id", (task_id,)
+            )
+        ]
+
+    def version_mails(self, task_id: str, version: int, role: str) -> list[dict[str, Any]]:
+        """该版本某角色累积的全部来源邮件，按接收时间排序（早→晚）。
+        核心按此顺序合并：早先补件填充的字段保留，后续补件继续补缺。"""
+        return [
+            dict(row)
+            for row in self.db.fetchall(
+                """
+                SELECT * FROM task_version_mails
+                 WHERE task_id = ? AND version = ? AND role = ?
+                 ORDER BY created_at, rowid
+                """,
+                (task_id, version, role),
             )
         ]
 

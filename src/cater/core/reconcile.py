@@ -145,8 +145,14 @@ def _add_field(rec: MachineRecord, name: str, raw, source: Source, issues: list,
 
 
 def reconcile_machines(mail_rows: list, invoice_rows: list, packing_rows: list,
-                       weight_groups: list, machine_index=None) -> ReconcileResult:
-    """machine_index 用于 Material 显式别名的同义判定（与目的国 scope 无关）。"""
+                       weight_groups: list, machine_index=None,
+                       supplement_rows: Optional[list] = None) -> ReconcileResult:
+    """machine_index 用于 Material 显式别名的同义判定（与目的国 scope 无关）。
+
+    ``supplement_rows`` 为补件邮件业务表（同一 MSO 的后续补充行）：与原始
+    邮件行同样按 MSO 经 _add_field 逐字段合并——缺失填充、一致去重保留
+    双来源、真实冲突列两处原值与来源并暂停，不静默覆盖；只影响其 MSO
+    对应的记录。表内 MSO 重复仍报 DUPLICATE_RECORD。"""
     result = ReconcileResult()
     records: dict[str, MachineRecord] = {}
     order_counter = 0
@@ -174,6 +180,31 @@ def reconcile_machines(mail_rows: list, invoice_rows: list, packing_rows: list,
             ))
             continue
         seen_mail_msos.add(mso)
+        rec = get_rec(mso)
+        for mail_field, std in MAIL_FIELDS.items():
+            _add_field(rec, std, row.fields.get(mail_field), row.source,
+                       result.issues, machine_index)
+
+    # 补件业务表：逐字段合并到对应 MSO（来源为补件邮件，provenance 分开）。
+    # 多封部分表格补件按 MSO 跨封累积：同一 MSO 允许出现在多封里（各提供
+    # 部分字段，早先填充的保留，后到的只补缺失）；只有同一封内同一 MSO
+    # 重复出现才算 DUPLICATE_RECORD。
+    supplement_seen: dict[str, str] = {}
+    for row in supplement_rows or []:
+        mso = normalize_identifier(row.fields.get("mso"))
+        if not mso:
+            continue
+        source_key = str(getattr(row.source, "message_id", None) or id(row.source))
+        if supplement_seen.get(mso) == source_key:
+            result.issues.append(Issue(
+                code="DUPLICATE_RECORD",
+                record_key=mso,
+                message=f"同一封补件业务表中 MSO {mso} 重复出现",
+                sources=[row.source],
+                required_action="请确认该机器在业务表中只出现一次",
+            ))
+            continue
+        supplement_seen[mso] = source_key
         rec = get_rec(mso)
         for mail_field, std in MAIL_FIELDS.items():
             _add_field(rec, std, row.fields.get(mail_field), row.source,
@@ -253,7 +284,11 @@ def reconcile_machines(mail_rows: list, invoice_rows: list, packing_rows: list,
                 field=",".join(missing),
                 message=f"MSO {mso} 合并后仍缺必需字段：{', '.join(missing)}",
                 sources=[fv.source for k, fv in rec.fields.items()],
-                required_action=f"请补充回复，例如 MSO={mso}；{missing[0]}=<值>",
+                required_action=(
+                    f"请将包含表头与 MSO 列的完整业务表直接粘贴到回复中"
+                    f"（HTML 表格或以 Tab/空格明确分列的文本均可；"
+                    f"本行缺少：{', '.join(missing)}）"
+                ),
             ))
 
     result.records = sorted(records.values(), key=lambda r: r.order_index)

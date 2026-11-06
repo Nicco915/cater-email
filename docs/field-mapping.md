@@ -59,6 +59,46 @@
 数据来源：邮件正文业务表（非引用区）+ 附件 `Invoice` / `Packing list`。
 按 MSO 关联；序列号辅助核对；禁止凭行号或仅凭机型拼接。
 
+### 2.0 邮件业务表表头语义别名
+
+表头匹配为规范化后的**精确匹配**（NFKC、大小写折叠、去空白/换行/标点），
+不做模糊猜测：Order / Dealer Order / MSO 语义不同互不归并；单价类与
+Total Sales Price 不混同。默认受控同义词（语义字段名与核心 schema 一致）：
+
+| 语义字段 | 默认别名（规范化后） |
+|---|---|
+| mso | `custpurchorder`（Cust. Purch. Order，含或不含 (MSO#) 标记）、`custpurchordermso`、`custpurchordermso号`、`mso` |
+| serial_number | `serialnumber`（Serial Number）、`soserialnumber`（SO Serial Number） |
+| region | `regional`、`region` |
+| order | `order` |
+| dealer_order | `dealerorder` |
+| dealer_code | `dealer`、`dealercode` |
+| ship_to_party | `shiptoparty` |
+| dealer_name | `dealername` |
+| material | `material` |
+| net_value | `netvalueorditem` |
+| currency | `doccurrency` |
+| order_status | `orderstatus` |
+| dealer_net_net | `dealernetnet` |
+| inland_freight | `inlandfreight` |
+| ocean_freight | `oceanfreight`、`oceanfrieight`（历史样例原始拼写） |
+| insurance / others | `insurance` / `others` |
+| total_sales_price | `totalsalesprice` |
+
+新表头变体经 `[core.header_aliases]` 配置按语义字段名追加（与整机/配件
+工作簿表头别名同一配置项），例如 `mso = ["客户采购单号"]`。配置示例见
+`config/config.example.toml`。
+
+同名别名归两个**邮件**语义字段（如 `mso` 又配给 `dealer_code`）会被拒绝：
+解析整体暂停并登记 `ALIAS_CONFIG_CONFLICT`，不静默取后配项。邮件与工作簿
+是两个命名空间，同一写法各归各的字段不算冲突。
+
+结构规则：业务表必须含 MSO 语义列；前导标题行跳过；双行/合并（rowspan/
+colspan）表头按逻辑网格保守组合；同一语义字段映射到多列或同一行两个不同
+取值 → `AMBIGUOUS_COLUMN` 暂停；未识别列如实上报 `UNKNOWN_MAIL_HEADER`
+（非阻断，照常处理已识别列）；引用历史（blockquote/gmail_quote/`>` 行）
+中的表永远不参与。
+
 ### 2.1 双来源核对
 
 | 标准字段 | 邮件业务表列 | 工作簿列 | 冲突处理 |

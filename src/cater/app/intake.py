@@ -18,6 +18,7 @@ from .mail.message import ParsedAttachment, ParsedMail, parse_mail
 from .mail_store import MailStore
 from .reference import ReferenceService
 from .settings import SettingsService
+from ..core.parsing.mail_html import mail_has_business_table
 from .supplement import (
     Association,
     SupplementParse,
@@ -448,21 +449,30 @@ class IntakeService:
             or supplement.overrides
             or supplement.bare_fields
             or non_inline_attachments
+            or mail_has_business_table(
+                parsed.html_body, parsed.text_body,
+                self.config.core.header_aliases or None)
         ):
             return self._reject_command(
                 mail,
                 task,
                 version,
                 "command_with_payload",
-                "指令邮件不能夹带附件或字段修改，本次未执行任何操作，您的资料未作改动。"
-                "请先按提示格式发送需要补充的附件或字段，再单独发送指令。",
+                "指令邮件不能夹带附件、业务表格或字段修改，本次未执行任何操作，您的资料未作改动。"
+                "请先按提示格式发送需要补充的附件或业务表，再单独发送指令。",
             )
         if command_count == 1:
             return self._handle_command(mail, parsed, supplement, task, version)
 
         # ----- data supplements and/or attachment replacement -------------
         business_attachments = self._business_attachments(parsed)
-        if not supplement.has_actions and not business_attachments:
+        # 表格补件：原任务发起人直接回复完整业务表（HTML 或以 Tab/空格
+        # 明确分列的文本，quoted 历史不计）即视为实质性补充——缺失字段由
+        # 核心按 MSO 合并填充，不要求逐条 修正： 指令。
+        table_present = mail_has_business_table(
+            parsed.html_body, parsed.text_body,
+            self.config.core.header_aliases or None)
+        if not supplement.has_actions and not business_attachments and not table_present:
             issue = {
                 "code": "UNSTRUCTURED_SUPPLEMENT",
                 "record_key": None,
@@ -474,7 +484,8 @@ class IntakeService:
                 "sources": [{"kind": "mail", "mail_id": mail["id"]}],
                 "required_action": (
                     "Reply with 目的国：法国, 国家映射：France=FRA, "
-                    "or 修正：<record_key>.<field>=<value>."
+                    "修正：<record_key>.<field>=<value>, "
+                    "or paste the full business table (header + MSO column)."
                 ),
             }
             self.tasks.add_issue(str(task["id"]), version, issue)
@@ -740,6 +751,9 @@ class IntakeService:
                 ),
                 overrides=override_rows,
                 inputs=input_rows,
+                version_mails=(
+                    [(str(mail["id"]), "supplement_table")] if table_present else []
+                ),
             )
         except Exception:
             self._cleanup_moved(task_id, str(mail["id"]), moved)

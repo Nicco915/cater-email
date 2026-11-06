@@ -9,6 +9,8 @@ from email.utils import formatdate, make_msgid
 from pathlib import Path
 from typing import Any
 
+import openpyxl
+
 from cater.app.config import (
     AllowlistConfig,
     AppConfig,
@@ -20,6 +22,61 @@ from cater.app.config import (
 )
 from cater.app.engine import CoreUnavailable
 from cater.app.mail.gateway import RawMessage
+
+
+def build_machine_xlsx(
+    path: Path,
+    *,
+    net: float = 24000.0,
+    serials: tuple[str, str] = ("SYN000001A", "SYN000002B"),
+    msos: tuple[str, str] = ("FAKE001", "FAKE002"),
+    invoice_no: str = "SYN-TEST-0001",
+) -> Path:
+    """合成整机发票/箱单 xlsx（结构仿 flexible_machine.xls，数据全合成：
+    FAKE MSO / SYN 序列号），供整机全链测试作为附件来源。"""
+    book = openpyxl.Workbook()
+    ci = book.active
+    ci.title = "CI"
+    ci.cell(9, 12, "INVOICE NO.: " + invoice_no)
+    ci.cell(34, 3, f"CMOPS MSO#: {msos[0]}/{msos[1]}\nSEMTEST WHEEL LOADER")
+    ci.cell(53, 1, f"NET WEIGHT: {net:g} KG")
+    ci.cell(55, 1, "MACHINE INFORMATION:")
+    for col, title in ((1, "ITEM#"), (2, "MODEL"), (5, "SERIAL #"),
+                       (7, "ENGINE #"), (11, "PIN #"), (15, "MSO")):
+        ci.cell(56, col, title)
+    for row, (serial, mso, engine, pin) in (
+        (57, (serials[0], msos[0], "SYNENG001", "SYNPIN0000001")),
+        (58, (serials[1], msos[1], "SYNENG002", "SYNPIN0000002")),
+    ):
+        ci.cell(row, 1, row - 56)
+        ci.cell(row, 2, "SEMTEST")
+        ci.cell(row, 5, serial)
+        ci.cell(row, 7, engine)
+        ci.cell(row, 11, pin)
+        ci.cell(row, 15, mso)
+    pl = book.create_sheet("PL")
+    pl.cell(9, 14, "INVOICE NO.: " + invoice_no)
+    pl.cell(28, 1, "DESCRIPTION OF GOODS")
+    pl.cell(28, 13, "QTY")
+    pl.cell(28, 16, "TOTAL WEIGHT/KGS")
+    pl.cell(29, 16, "GROSS")
+    pl.cell(29, 19, "NET")
+    description = (
+        f"CMOPS MSO#: {msos[0]}/{msos[1]}\nSEMTEST WHEEL LOADER\n"
+        f"SN: {serials[0]}/{serials[1]}"
+    )
+    pl.cell(30, 1, description)
+    pl.cell(30, 13, 2)
+    pl.cell(30, 14, "UNITS")
+    pl.cell(30, 16, net)
+    pl.cell(30, 19, net)
+    pl.cell(31, 1, "TOTAL")
+    pl.cell(31, 13, 2)
+    pl.cell(31, 16, net)
+    pl.cell(31, 19, net)
+    book.save(path)
+    return path
+
 
 
 @dataclass

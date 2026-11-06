@@ -45,7 +45,7 @@ def test_existing_database_is_upgraded_without_losing_reference_rows(
 
     database = Database(path)
     try:
-        assert database.schema_version() == 11
+        assert database.schema_version() == 13
         assert database.quick_check() == "ok"
         rows = [dict(row) for row in database.fetchall("SELECT * FROM machine_materials")]
         assert len(rows) == 1
@@ -117,7 +117,7 @@ def test_nonempty_old_db_upgrades_keeping_tasks_and_outbox(tmp_path: Path) -> No
 
     database = Database(path)
     try:
-        assert database.schema_version() == 11
+        assert database.schema_version() == 13
         assert database.quick_check() == "ok"
         # Task and outbox preserved.
         assert database.scalar("SELECT COUNT(*) FROM tasks") == 1
@@ -170,7 +170,7 @@ def test_migration_11_layout_columns_and_confirmed_table(tmp_path: Path) -> None
     """布局持久化：task_versions.layout_json 列与 confirmed_layouts 表。"""
     database = Database(tmp_path / "fresh.sqlite3")
     try:
-        assert database.schema_version() == 11
+        assert database.schema_version() == 13
         columns = {
             row[1]
             for row in database.fetchall("PRAGMA table_info(task_versions)")
@@ -210,5 +210,87 @@ def test_migration_11_layout_columns_and_confirmed_table(tmp_path: Path) -> None
         )
         assert row["structure_json"] == '{"v":2}'
         assert row["actor"] == "b"
+    finally:
+        database.close()
+
+def test_migration_12_task_version_source_mails(tmp_path: Path) -> None:
+    """版本来源邮件：task_version_mails 表随版本记录补件业务表邮件。
+
+    migration 13 后主键为 (task_id, version, role, mail_id)：同一版本
+    同角色可累积多封来源邮件（连续部分表格补件各自留痕）。"""
+    database = Database(tmp_path / "fresh.sqlite3")
+    try:
+        assert database.schema_version() == 13
+        tables = {
+            row[0]
+            for row in database.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "task_version_mails" in tables
+        database.insert(
+            """
+            INSERT INTO mail_messages (id, account, folder, uid, raw_hash, sender,
+                direction, created_at)
+            VALUES ('mail_1', 'bot@example.com', 'INBOX', 1, 'h1',
+                'tester@example.com', 'inbound', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO mail_messages (id, account, folder, uid, raw_hash, sender,
+                direction, created_at)
+            VALUES ('mail_2', 'bot@example.com', 'INBOX', 2, 'h2',
+                'tester@example.com', 'inbound', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO tasks (id, owner, kind, status, version, created_at, updated_at)
+            VALUES ('task_x', 'tester@example.com', 'machine', 'WAITING_INPUT', 1,
+                't', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO task_versions (task_id, version, status, created_at)
+            VALUES ('task_x', 1, 'WAITING_INPUT', 't')
+            """
+        )
+        # 同版本同角色多封来源邮件：累积而非覆盖
+        database.insert(
+            """
+            INSERT INTO task_version_mails (task_id, version, mail_id, role, created_at)
+            VALUES ('task_x', 1, 'mail_1', 'supplement_table', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO task_version_mails (task_id, version, mail_id, role, created_at)
+            VALUES ('task_x', 1, 'mail_2', 'supplement_table', 't2')
+            """
+        )
+        rows = database.fetchall(
+            "SELECT * FROM task_version_mails WHERE task_id = 'task_x' ORDER BY created_at"
+        )
+        assert [row["mail_id"] for row in rows] == ["mail_1", "mail_2"]
+        assert all(row["role"] == "supplement_table" for row in rows)
+        # 外键强制：不存在的邮件/版本必须被拒绝
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert(
+                """
+                INSERT INTO task_version_mails (task_id, version, mail_id, role,
+                    created_at)
+                VALUES ('task_x', 1, 'no_such_mail', 'supplement_table', 't')
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert(
+                """
+                INSERT INTO task_version_mails (task_id, version, mail_id, role,
+                    created_at)
+                VALUES ('task_x', 99, 'mail_1', 'supplement_table', 't')
+                """
+            )
     finally:
         database.close()

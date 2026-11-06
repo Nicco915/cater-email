@@ -48,10 +48,14 @@ max_message_bytes = 62914560
 # 规范化（大小写/空白/标点不敏感）后精确匹配，不做模糊匹配；
 # 配件与整机解析共用，默认内置别名集始终保留。
 # 每个任务版本的请求快照都会携带本配置，重试不依赖当时的配置文件。
-# 字段名见 src/cater/core/parsing/headers.py DEFAULT_ALIASES。
+# 字段名见 src/cater/core/parsing/headers.py DEFAULT_ALIASES（整机/配件
+# 工作簿表头），以及 src/cater/core/parsing/mail_html.py MAIL_DEFAULT_ALIASES
+# （邮件业务表表头，语义字段名与核心 schema 一致，如 mso/serial_number）。
 # [core.header_aliases]
-# unit_price = ["Final Price", "结算价"]
-# model      = ["Type", "机型代号"]
+# unit_price     = ["Final Price", "结算价"]
+# model          = ["Type", "机型代号"]
+# mso            = ["客户采购单号"]
+# serial_number  = ["序列"]
 
 [allowlist]
 # test 与 production 两套名单相互隔离。

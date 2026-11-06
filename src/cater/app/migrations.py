@@ -494,6 +494,46 @@ CREATE TABLE IF NOT EXISTS confirmed_layouts (
 """
 
 
+MIGRATION_12 = """
+-- 每个版本的补充来源邮件：某版本的业务表由哪封（补件）邮件提供。
+-- role 目前仅有 supplement_table；同一版本同一角色只记录一封最新邮件。
+-- 与 task_versions 同生共死（CASCADE），随补件事务一起回滚。
+CREATE TABLE IF NOT EXISTS task_version_mails (
+    task_id     TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    mail_id     TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (task_id, version, role),
+    FOREIGN KEY (task_id, version) REFERENCES task_versions(task_id, version) ON DELETE CASCADE,
+    FOREIGN KEY (mail_id) REFERENCES mail_messages(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_version_mails_mail ON task_version_mails(mail_id);
+"""
+
+
+MIGRATION_13 = """
+-- 版本来源邮件需要“累积”：连续多封表格补件各提供部分字段时，新版本必须
+-- 继承之前所有版本积累的来源邮件（否则早先补件填充的字段会丢）。
+-- 主键扩为 (task_id, version, role, mail_id)，允许同版本多封来源邮件。
+CREATE TABLE task_version_mails_v2 (
+    task_id     TEXT NOT NULL,
+    version     INTEGER NOT NULL,
+    mail_id     TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (task_id, version, role, mail_id),
+    FOREIGN KEY (task_id, version) REFERENCES task_versions(task_id, version) ON DELETE CASCADE,
+    FOREIGN KEY (mail_id) REFERENCES mail_messages(id)
+);
+INSERT OR IGNORE INTO task_version_mails_v2
+    SELECT task_id, version, mail_id, role, created_at FROM task_version_mails;
+DROP TABLE task_version_mails;
+ALTER TABLE task_version_mails_v2 RENAME TO task_version_mails;
+CREATE INDEX IF NOT EXISTS idx_task_version_mails_mail ON task_version_mails(mail_id);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", MIGRATION_1),
     Migration(2, "additional_indexes", MIGRATION_2),
@@ -506,4 +546,6 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(9, "restored_task_retry_hold", MIGRATION_9),
     Migration(10, "reference_tombstones", MIGRATION_10),
     Migration(11, "confirmed_layouts", MIGRATION_11),
+    Migration(12, "task_version_source_mails", MIGRATION_12),
+    Migration(13, "task_version_source_mails_accumulate", MIGRATION_13),
 )
