@@ -105,3 +105,23 @@ def load_import_machine_reference() -> Callable[[str], list[dict[str, Any]]]:
     if not callable(function):
         raise CoreUnavailable("cater.core.api.import_machine_reference is missing or not callable")
     return function
+
+
+def load_inspect_sources() -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Lazy access to the core's multi-ticket split-preview entry point.
+
+    Used by the offline preview service only; it never initialises the app
+    database, outbox, or poller, and it does not require core templates.
+    """
+    try:
+        module = importlib.import_module("cater.core.api")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"cater.core", "cater.core.api"}:
+            raise CoreUnavailable(
+                "cater.core.api is not available yet; ticket preview requires the core"
+            ) from exc
+        raise
+    function = getattr(module, "inspect_sources", None)
+    if not callable(function):
+        raise CoreUnavailable("cater.core.api.inspect_sources is missing or not callable")
+    return function

@@ -17,9 +17,12 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+# 表单解析产出 starlette.datastructures.UploadFile；fastapi.UploadFile 是其
+# 子类，isinstance 反用会漏判，上传校验必须基于 starlette 基类。
+from starlette.datastructures import UploadFile
 from starlette.templating import Jinja2Templates
 
 from .. import state
@@ -1002,6 +1005,133 @@ def create_app(
             "/references",
             lambda: service.confirm_machine_reference(token, actor="web-admin"),
             success="机型库已按预览确认写入",
+        )
+
+    # ------------------------------------------------------------------
+    # multi-ticket batches (阶段 2：导入/方案/人工确认建票)
+    # ------------------------------------------------------------------
+    @app.get("/batches", response_class=HTMLResponse)
+    def batch_list(request: Request):
+        batches = service.batches.list_batches(limit=200)
+        return render(request, "batches.html", batches=batches)
+
+    @app.post("/batches/import")
+    async def batch_import(request: Request):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            return flash_redirect("/batches", error="请选择一个本地 .eml 文件")
+        filename = safe_filename(upload.filename, fallback="mail.eml")
+        if not filename.lower().endswith(".eml"):
+            return flash_redirect("/batches", error="批次导入只接受 .eml 邮件文件")
+        maximum = max(1024, int(service.config.mail.max_message_bytes))
+        data = await upload.read(maximum + 1)
+        if len(data) > maximum:
+            return flash_redirect("/batches", error="邮件文件超过大小限制")
+        try:
+            result = service.batches.import_eml_bytes(
+                data, filename=filename, actor="web-admin")
+        except CaterError as exc:
+            return flash_redirect("/batches", error=f"{exc.code}: {exc}")
+        except Exception as exc:
+            service.logger.exception("web_batch_import_failed", exc)
+            return flash_redirect("/batches", error=f"{type(exc).__name__}: {exc}")
+        batch = result["batch"]
+        if result["created"]:
+            return flash_redirect(
+                f"/batches/{batch['id']}",
+                message="已导入批次并完成首轮识别，请核对候选与未归属项")
+        return flash_redirect(
+            f"/batches/{batch['id']}",
+            message="该邮件已导入过（同一发件人+内容），返回既有批次")
+
+    def _batch_or_404(batch_id: str) -> dict[str, Any]:
+        batch = service.batches.get_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        return batch
+
+    @app.get("/batches/{batch_id}", response_class=HTMLResponse)
+    def batch_detail_page(request: Request, batch_id: str):
+        plan_id = (request.query_params.get("plan") or "").strip() or None
+        try:
+            detail = service.batches.batch_detail(batch_id, plan_id=plan_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        return render(request, "batch_detail.html", **detail)
+
+    @app.post("/batches/{batch_id}/adjust")
+    async def batch_adjust(request: Request, batch_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        _batch_or_404(batch_id)
+        op_type = text(form, "op_type")
+        op: dict[str, Any] = {"type": op_type, "action": text(form, "action")}
+        if text(form, "reason"):
+            op["reason"] = text(form, "reason")
+        if text(form, "candidate_id"):
+            op["candidate_id"] = text(form, "candidate_id")
+        try:
+            if op_type == "mail_row":
+                op["table_index"] = int(text(form, "table_index"))
+                op["row"] = int(text(form, "row"))
+            elif op_type == "source":
+                op["sha256"] = text(form, "sha256")
+        except ValueError:
+            return flash_redirect(f"/batches/{batch_id}", error="调整定位参数无效")
+        return run_action(
+            request,
+            f"/batches/{batch_id}",
+            lambda: service.batches.adjust_plan(
+                batch_id,
+                base_plan_id=text(form, "base_plan_id"),
+                ops=[op],
+                actor="web-admin",
+                reason=text(form, "reason") or None,
+            ),
+            success="已应用调整并生成新方案版本",
+        )
+
+    @app.post("/batches/{batch_id}/confirm")
+    async def batch_confirm(request: Request, batch_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        _batch_or_404(batch_id)
+        selected = [str(v) for v in form.getlist("selected") if str(v).strip()]
+        exclusions: dict[str, str] = {}
+        for key, value in form.multi_items():
+            name = str(key)
+            if name.startswith("excl_"):
+                candidate_key = name[len("excl_"):]
+                if candidate_key not in selected:
+                    exclusions[candidate_key] = str(value).strip()
+        return run_action(
+            request,
+            f"/batches/{batch_id}",
+            lambda: service.batches.confirm_and_create(
+                batch_id,
+                plan_id=text(form, "plan_id"),
+                fingerprint=text(form, "fingerprint"),
+                selected=selected,
+                exclusions=exclusions,
+                actor="web-admin",
+            ),
+            success="已确认方案并创建逐票任务（本阶段任务保持挂起，不执行）",
+        )
+
+    @app.get("/batches/{batch_id}/assets/{asset_id}")
+    def batch_asset_download(batch_id: str, asset_id: str):
+        try:
+            asset = service.batches.asset_for_download(batch_id, asset_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        except CaterError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return FileResponse(
+            asset["resolved_path"],
+            media_type="application/octet-stream",
+            filename=safe_filename(str(asset.get("filename") or "asset.bin")),
         )
 
     # ------------------------------------------------------------------

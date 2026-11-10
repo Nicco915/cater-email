@@ -273,6 +273,11 @@ class AppService:
             self.mail_store,
             self.gateway,
         )
+        from .batches import BatchService
+
+        self.batches = BatchService(
+            self.db, config, self.logger, self.tasks, self.mail_store
+        )
         self._reference_importer = reference_importer
         self.recovery_report: dict[str, Any] = {}
         # Global, task-less poll failures (for example IMAP down) surface only
@@ -308,6 +313,22 @@ class AppService:
         if task.get("deleted_at") is not None:
             raise StateTransitionError(
                 f"任务 {task['id']} 已删除到回收站，不能{action}；请先从回收站恢复"
+            )
+
+    def _require_execution_not_held(self, task: dict[str, Any], action: str) -> None:
+        """Refuse any execution-style action on a held batch child task.
+
+        Multi-ticket batch tasks are materialized with ``execution_hold=1``:
+        in this phase no process/retry/reprocess/supplement-continue/deliver
+        path may run them (not only hiding buttons in the UI). Release is a
+        deliberate future-phase action, not something a caller can bypass.
+        """
+
+        hold = self.tasks.batch_hold(str(task["id"]))
+        if hold is not None:
+            raise StateTransitionError(
+                f"任务 {task['id']} 由多票批次 {hold['batch_id']} 创建，"
+                f"尚未开放执行，不能{action}：{hold['hold_reason']}"
             )
     def recover(self) -> dict[str, Any]:
         interrupted_tasks = self.tasks.recover_incomplete()
@@ -722,6 +743,7 @@ class AppService:
     ) -> dict[str, Any]:
         task = self.tasks.require(task_id)
         self._require_active(task, "处理")
+        self._require_execution_not_held(task, "处理")
         status = str(task["status"])
         if status in {state.CANCELLED, state.SEND_UNKNOWN}:
             raise StateTransitionError(f"Task {task_id} is {status}; resolve it before processing")
@@ -1463,6 +1485,7 @@ class AppService:
     def retry_task(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
         task = self.tasks.require(task_id)
         self._require_active(task, "重试")
+        self._require_execution_not_held(task, "重试")
         if task["status"] not in {state.RETRY_PENDING, state.FAILED}:
             raise StateTransitionError("Only RETRY_PENDING or FAILED tasks can be retried")
         self.tasks.reset_retry_budget(task_id)
@@ -1555,6 +1578,7 @@ class AppService:
     ) -> dict[str, Any]:
         task = self.tasks.require(task_id)
         self._require_active(task, "重新处理")
+        self._require_execution_not_held(task, "重新处理")
         if task["status"] in {state.PROCESSING, state.VALIDATING, state.SEND_UNKNOWN}:
             raise StateTransitionError(
                 f"Task {task_id} is {task['status']}; resolve it before reprocessing"
@@ -1588,6 +1612,7 @@ class AppService:
     def confirm_reprocess(self, task_id: str, *, actor: str = "admin") -> dict[str, Any]:
         task = self.tasks.require(task_id)
         self._require_active(task, "确认重新处理")
+        self._require_execution_not_held(task, "确认重新处理")
         if not any(
             issue["code"] == "REPROCESS_CONFIRMATION_REQUIRED" and issue["status"] == "open"
             for issue in self.tasks.issues(task_id)
@@ -1611,6 +1636,7 @@ class AppService:
 
         task = self.tasks.require(task_id)
         self._require_active(task, "交付")
+        self._require_execution_not_held(task, "交付")
         if task["status"] != state.READY_TO_SEND:
             raise StateTransitionError(
                 "Only READY_TO_SEND tasks can be delivered; reprocess or resolve first"

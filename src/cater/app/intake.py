@@ -111,6 +111,16 @@ GUIDANCE_DELETED_TASK = (
     "查询状态请单独写：查询状态。"
 )
 
+# 批次子任务尚未开放执行：补件/重试/重新处理指令一律显式拒绝并引导，
+# 不把批次相关回复路由到任意一票。
+GUIDANCE_BATCH_HELD = (
+    "您好：\n\n"
+    "这封邮件关联的任务属于一个多票批次，已按确认的方案建票，但目前尚未开放处理，"
+    "因此本次没有执行补件、重试或重新处理，也没有发送任何结果。\n"
+    "如需处理该批次，请联系维护人员在管理界面核对批次方案；"
+    "批次相关回复在没有唯一子任务定位时不会被归入任何一票。"
+)
+
 
 def _mail_fingerprint(mail: dict[str, Any]) -> str:
     return str(mail.get("raw_hash") or mail.get("message_id") or mail["id"])
@@ -262,6 +272,16 @@ class IntakeService:
                 )
 
         if association.task_id:
+            if self.tasks.is_execution_held(str(association.task_id)):
+                # 批次子任务本阶段不可执行：补件/指令显式拒绝并引导，
+                # 不路由到任意一票、不触发任何自动继续。
+                result = self._filter(
+                    mail,
+                    "batch_task_held",
+                    task_id=str(association.task_id),
+                )
+                result.guidance = GUIDANCE_BATCH_HELD
+                return result
             return self._handle_supplement(mail, parsed, supplement, association)
         return self._handle_new(mail, parsed, supplement)
 

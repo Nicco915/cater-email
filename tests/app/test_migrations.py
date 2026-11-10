@@ -45,7 +45,7 @@ def test_existing_database_is_upgraded_without_losing_reference_rows(
 
     database = Database(path)
     try:
-        assert database.schema_version() == 13
+        assert database.schema_version() == 15
         assert database.quick_check() == "ok"
         rows = [dict(row) for row in database.fetchall("SELECT * FROM machine_materials")]
         assert len(rows) == 1
@@ -117,7 +117,7 @@ def test_nonempty_old_db_upgrades_keeping_tasks_and_outbox(tmp_path: Path) -> No
 
     database = Database(path)
     try:
-        assert database.schema_version() == 13
+        assert database.schema_version() == 15
         assert database.quick_check() == "ok"
         # Task and outbox preserved.
         assert database.scalar("SELECT COUNT(*) FROM tasks") == 1
@@ -170,7 +170,7 @@ def test_migration_11_layout_columns_and_confirmed_table(tmp_path: Path) -> None
     """布局持久化：task_versions.layout_json 列与 confirmed_layouts 表。"""
     database = Database(tmp_path / "fresh.sqlite3")
     try:
-        assert database.schema_version() == 13
+        assert database.schema_version() == 15
         columns = {
             row[1]
             for row in database.fetchall("PRAGMA table_info(task_versions)")
@@ -220,7 +220,7 @@ def test_migration_12_task_version_source_mails(tmp_path: Path) -> None:
     同角色可累积多封来源邮件（连续部分表格补件各自留痕）。"""
     database = Database(tmp_path / "fresh.sqlite3")
     try:
-        assert database.schema_version() == 13
+        assert database.schema_version() == 15
         tables = {
             row[0]
             for row in database.fetchall(
@@ -290,6 +290,107 @@ def test_migration_12_task_version_source_mails(tmp_path: Path) -> None:
                 INSERT INTO task_version_mails (task_id, version, mail_id, role,
                     created_at)
                 VALUES ('task_x', 99, 'mail_1', 'supplement_table', 't')
+                """
+            )
+    finally:
+        database.close()
+
+
+def test_migration_14_multi_ticket_batch_tables(tmp_path: Path) -> None:
+    """多票批次表：迁移14 新建批次/方案/候选/资产/关联/事件表，约束生效。"""
+    database = Database(tmp_path / "fresh.sqlite3")
+    try:
+        assert database.schema_version() == 15
+        tables = {
+            row[0]
+            for row in database.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for name in (
+            "mail_batches", "batch_plan_versions", "batch_candidates",
+            "batch_assets", "batch_tasks", "batch_events",
+        ):
+            assert name in tables
+        # 批次邮件身份唯一：(account, owner, mail_hash)
+        database.insert(
+            """
+            INSERT INTO mail_messages (id, account, folder, uid, raw_hash, sender,
+                direction, created_at)
+            VALUES ('mail_b', 'bot@example.com', 'OFFLINE-BATCH', 1, 'h1',
+                'tester@example.com', 'inbound', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO mail_batches (id, mail_id, account, owner, mail_hash,
+                status, created_at, created_by)
+            VALUES ('batch_1', 'mail_b', 'bot@example.com', 'tester@example.com',
+                'h1', 'open', 't', 'cli')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert(
+                """
+                INSERT INTO mail_batches (id, mail_id, account, owner, mail_hash,
+                    status, created_at, created_by)
+                VALUES ('batch_2', 'mail_b', 'bot@example.com',
+                    'tester@example.com', 'h1', 'open', 't', 'cli')
+                """
+            )
+        # 不同 owner / 原文不混批
+        database.insert(
+            """
+            INSERT INTO mail_batches (id, mail_id, account, owner, mail_hash,
+                status, created_at, created_by)
+            VALUES ('batch_3', 'mail_b', 'bot@example.com', 'other@example.com',
+                'h1', 'open', 't', 'cli')
+            """
+        )
+        # 方案版本唯一 (batch_id, version)
+        database.insert(
+            """
+            INSERT INTO batch_plan_versions (id, batch_id, version,
+                source_fingerprint, inspector_version, preview_json,
+                created_at, created_by)
+            VALUES ('plan_1', 'batch_1', 1, 'fp', 'v1', '{}', 't', 'cli')
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert(
+                """
+                INSERT INTO batch_plan_versions (id, batch_id, version,
+                    source_fingerprint, inspector_version, preview_json,
+                    created_at, created_by)
+                VALUES ('plan_2', 'batch_1', 1, 'fp2', 'v1', '{}', 't', 'cli')
+                """
+            )
+        # batch_tasks 关联：候选唯一 + 任务唯一 + 默认挂起
+        database.insert(
+            """
+            INSERT INTO tasks (id, owner, kind, status, version, created_at,
+                updated_at)
+            VALUES ('task_b1', 'tester@example.com', 'machine', 'RECEIVED', 1,
+                't', 't')
+            """
+        )
+        database.insert(
+            """
+            INSERT INTO batch_tasks (id, batch_id, plan_id, candidate_key,
+                task_id, snapshot_path, hold_reason, created_at)
+            VALUES ('bt_1', 'batch_1', 'plan_1', 'cand-x', 'task_b1',
+                '/tmp/x', 'hold', 't')
+            """
+        )
+        row = database.fetchone("SELECT * FROM batch_tasks WHERE id = 'bt_1'")
+        assert row["execution_hold"] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert(
+                """
+                INSERT INTO batch_tasks (id, batch_id, plan_id, candidate_key,
+                    task_id, snapshot_path, hold_reason, created_at)
+                VALUES ('bt_2', 'batch_1', 'plan_1', 'cand-y', 'task_b1',
+                    '/tmp/y', 'hold', 't')
                 """
             )
     finally:

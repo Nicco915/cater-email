@@ -534,6 +534,124 @@ CREATE INDEX IF NOT EXISTS idx_task_version_mails_mail ON task_version_mails(mai
 """
 
 
+MIGRATION_14 = """
+-- 多票批次（阶段 2）：本地导入 .eml -> 持久化批次/方案版本 -> 人工确认 ->
+-- 幂等创建逐票任务。只新增表，不改既有表结构。
+--
+-- 身份分层：
+-- * mail_batches 的永久邮件身份是 (account, owner, mail_hash)：同一原邮件
+--   重复/并发导入只建一批；不同邮箱/发件人/原文不会只因附件相同而混批。
+-- * source_fingerprint 含识别器/别名版本，只标识某次识别结果，不作为邮件
+--   身份（规则升级只产生新方案版本，不产生新批次）。
+-- * 批次ID / 方案版本ID / 候选内容寻址ID / 单票任务ID 是四种不同ID。
+
+CREATE TABLE IF NOT EXISTS mail_batches (
+    id                   TEXT PRIMARY KEY,
+    mail_id              TEXT NOT NULL REFERENCES mail_messages(id),
+    account              TEXT NOT NULL,
+    owner                TEXT NOT NULL,
+    owner_name           TEXT,
+    mail_hash            TEXT NOT NULL,
+    subject              TEXT,
+    message_id           TEXT,
+    status               TEXT NOT NULL DEFAULT 'open',
+    current_plan_id      TEXT,
+    confirmed_plan_id    TEXT,
+    confirmed_fingerprint TEXT,
+    confirmed_at         TEXT,
+    confirmed_by         TEXT,
+    materialized_at      TEXT,
+    created_at           TEXT NOT NULL,
+    created_by           TEXT NOT NULL,
+    UNIQUE (account, owner, mail_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_mail_batches_status ON mail_batches(status);
+
+-- 每次识别/调整产生一个不可变新版本；旧版本永不覆写。
+CREATE TABLE IF NOT EXISTS batch_plan_versions (
+    id                TEXT PRIMARY KEY,
+    batch_id          TEXT NOT NULL REFERENCES mail_batches(id),
+    version           INTEGER NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    inspector_version TEXT NOT NULL,
+    alias_marker      TEXT,
+    preview_json      TEXT NOT NULL,
+    assignments_json  TEXT NOT NULL DEFAULT '[]',
+    derived_from      TEXT,
+    batch_ready       INTEGER NOT NULL DEFAULT 0,
+    reason            TEXT,
+    created_at        TEXT NOT NULL,
+    created_by        TEXT NOT NULL,
+    UNIQUE (batch_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_plans_batch
+    ON batch_plan_versions(batch_id, version);
+
+-- 每个方案版本下的候选票快照及人工选入/排除决定（未选=pending，不丢票）。
+CREATE TABLE IF NOT EXISTS batch_candidates (
+    id              TEXT PRIMARY KEY,
+    plan_id         TEXT NOT NULL REFERENCES batch_plan_versions(id),
+    batch_id        TEXT NOT NULL REFERENCES mail_batches(id),
+    candidate_key   TEXT NOT NULL,
+    kind            TEXT,
+    preview_json    TEXT NOT NULL,
+    decision        TEXT NOT NULL DEFAULT 'pending',
+    decision_reason TEXT,
+    decided_by      TEXT,
+    decided_at      TEXT,
+    UNIQUE (plan_id, candidate_key)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_candidates_batch
+    ON batch_candidates(batch_id);
+
+-- 邮件原件与原始附件：不可变保存一次，内容哈希 + 来源定位。
+CREATE TABLE IF NOT EXISTS batch_assets (
+    id          TEXT PRIMARY KEY,
+    batch_id    TEXT NOT NULL REFERENCES mail_batches(id),
+    role        TEXT NOT NULL,
+    filename    TEXT,
+    sha256      TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (batch_id, role, sha256)
+);
+
+-- 批次与单票任务的一对多关联；legacy mail_messages.task_id 保持单票语义，
+-- 多票归属只通过本表表达。execution_hold=1：本阶段任务不可执行。
+CREATE TABLE IF NOT EXISTS batch_tasks (
+    id              TEXT PRIMARY KEY,
+    batch_id        TEXT NOT NULL REFERENCES mail_batches(id),
+    plan_id         TEXT NOT NULL REFERENCES batch_plan_versions(id),
+    candidate_key   TEXT NOT NULL,
+    task_id         TEXT NOT NULL REFERENCES tasks(id),
+    snapshot_path   TEXT NOT NULL,
+    execution_hold  INTEGER NOT NULL DEFAULT 1,
+    hold_reason     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (batch_id, candidate_key),
+    UNIQUE (task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_tasks_task ON batch_tasks(task_id);
+
+CREATE TABLE IF NOT EXISTS batch_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    TEXT NOT NULL REFERENCES mail_batches(id),
+    plan_id     TEXT,
+    action      TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    detail_json TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batch_events_batch ON batch_events(batch_id, id);
+"""
+
+
+MIGRATION_15 = """
+ALTER TABLE batch_tasks ADD COLUMN snapshot_hash TEXT;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial_schema", MIGRATION_1),
     Migration(2, "additional_indexes", MIGRATION_2),
@@ -548,4 +666,6 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(11, "confirmed_layouts", MIGRATION_11),
     Migration(12, "task_version_source_mails", MIGRATION_12),
     Migration(13, "task_version_source_mails_accumulate", MIGRATION_13),
+    Migration(14, "multi_ticket_batches", MIGRATION_14),
+    Migration(15, "batch_task_snapshot_hash", MIGRATION_15),
 )

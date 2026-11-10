@@ -57,6 +57,77 @@ class TaskRepository:
     # ------------------------------------------------------------------
     # creation and lookup
     # ------------------------------------------------------------------
+    def _insert_task_conn(
+        self,
+        conn,
+        *,
+        task_id: str,
+        owner: str,
+        owner_name: str | None,
+        kind: str,
+        origin_mail_id: str,
+        destination_name: str | None = None,
+        destination_alpha3: str | None = None,
+        status: str = state.RECEIVED,
+        actor: str = "system",
+        now: str | None = None,
+        event_detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Insert task + v1 version + creation event on an open transaction.
+
+        Composable variant of :meth:`create`: the caller owns the transaction
+        (no nested BEGIN), e.g. the multi-ticket batch service creating all
+        child tasks atomically with the batch confirmation. Single-ticket
+        behaviour and events are unchanged.
+        """
+        now = now or utc_now()
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, owner, owner_name, kind, version, status, destination_name,
+                destination_alpha3, origin_mail_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                owner,
+                owner_name,
+                kind,
+                status,
+                destination_name,
+                destination_alpha3,
+                origin_mail_id,
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_versions (
+                task_id, version, status, destination_name, destination_alpha3, created_at
+            ) VALUES (?, 1, ?, ?, ?, ?)
+            """,
+            (task_id, status, destination_name, destination_alpha3, now),
+        )
+        detail = {"origin_mail_id": origin_mail_id, "kind": kind}
+        if event_detail:
+            detail.update(event_detail)
+        conn.execute(
+            """
+            INSERT INTO task_events (
+                task_id, version, attempt_id, stage, from_status, to_status,
+                code, detail_json, actor, created_at
+            ) VALUES (?, 1, NULL, 'intake', NULL, ?, 'task_created', ?, ?, ?)
+            """,
+            (
+                task_id,
+                status,
+                json.dumps(detail, ensure_ascii=False),
+                actor,
+                now,
+            ),
+        )
+
     def create(
         self,
         *,
@@ -69,54 +140,48 @@ class TaskRepository:
         status: str = state.RECEIVED,
     ) -> dict[str, Any]:
         task_id = new_id("task")
-        now = utc_now()
         with self.db.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO tasks (
-                    id, owner, owner_name, kind, version, status, destination_name,
-                    destination_alpha3, origin_mail_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    owner,
-                    owner_name,
-                    kind,
-                    status,
-                    destination_name,
-                    destination_alpha3,
-                    origin_mail_id,
-                    now,
-                    now,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO task_versions (
-                    task_id, version, status, destination_name, destination_alpha3, created_at
-                ) VALUES (?, 1, ?, ?, ?, ?)
-                """,
-                (task_id, status, destination_name, destination_alpha3, now),
-            )
-            conn.execute(
-                """
-                INSERT INTO task_events (
-                    task_id, version, attempt_id, stage, from_status, to_status,
-                    code, detail_json, actor, created_at
-                ) VALUES (?, 1, NULL, 'intake', NULL, ?, 'task_created', ?, 'system', ?)
-                """,
-                (
-                    task_id,
-                    status,
-                    json.dumps({"origin_mail_id": origin_mail_id, "kind": kind}, ensure_ascii=False),
-                    now,
-                ),
+            self._insert_task_conn(
+                conn,
+                task_id=task_id,
+                owner=owner,
+                owner_name=owner_name,
+                kind=kind,
+                origin_mail_id=origin_mail_id,
+                destination_name=destination_name,
+                destination_alpha3=destination_alpha3,
+                status=status,
             )
         self.logger.info("task_created", task_id=task_id, mail_id=origin_mail_id, kind=kind)
         task = self.get(task_id)
         assert task is not None
         return task
+
+    # ------------------------------------------------------------------
+    # multi-ticket batch execution hold (阶段 2)
+    # ------------------------------------------------------------------
+    def batch_hold(self, task_id: str) -> dict[str, Any] | None:
+        """The batch_tasks row if this task is a held batch child, else None.
+
+        Held tasks were materialized from a confirmed multi-ticket plan but
+        are not yet released for execution in this phase: no processing,
+        retry, reprocess, supplement continuation, delivery or trashing.
+        """
+        return _row(
+            self.db.fetchone(
+                "SELECT * FROM batch_tasks WHERE task_id = ? AND execution_hold = 1",
+                (task_id,),
+            )
+        )
+
+    def is_execution_held(self, task_id: str) -> bool:
+        return self.batch_hold(task_id) is not None
+
+    def held_batch_task_ids(self) -> set[str]:
+        rows = self.db.fetchall(
+            "SELECT task_id FROM batch_tasks WHERE execution_hold = 1"
+        )
+        return {str(row["task_id"]) for row in rows}
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         return _row(self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,)))
@@ -571,6 +636,8 @@ class TaskRepository:
                AND deleted_at IS NULL
                AND auto_retry_hold = 0
                AND (next_retry_at IS NULL OR next_retry_at <= ?)
+               AND id NOT IN (SELECT task_id FROM batch_tasks
+                              WHERE execution_hold = 1)
              ORDER BY updated_at LIMIT ?
             """,
             (state.RETRY_PENDING, now, max(1, min(int(limit), 50))),
@@ -1308,6 +1375,12 @@ class TaskRepository:
         inside the same transaction as the write (no TOCTOU window)."""
 
         status = str(task["status"])
+        if conn.execute(
+            "SELECT 1 FROM batch_tasks WHERE task_id = ? AND execution_hold = 1",
+            (str(task["id"]),),
+        ).fetchone() is not None:
+            return ("该任务由多票批次创建且尚未开放执行，本阶段不支持删除"
+                    "（批次审计必须完整保留）")
         if status in self.TRASH_BLOCKED_STATUSES:
             if status == state.SEND_UNKNOWN:
                 return "发送结果不确定，请先核对发送结果后再删除"
@@ -1598,7 +1671,12 @@ class TaskRepository:
 
         recovered: list[str] = []
         rows = self.db.fetchall(
-            "SELECT * FROM tasks WHERE status IN (?, ?, ?)",
+            """
+            SELECT * FROM tasks
+             WHERE status IN (?, ?, ?)
+               AND id NOT IN (SELECT task_id FROM batch_tasks
+                              WHERE execution_hold = 1)
+            """,
             (state.RECEIVED, state.VALIDATING, state.PROCESSING),
         )
         for row in rows:

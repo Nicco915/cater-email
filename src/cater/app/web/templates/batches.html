@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}多票批次 · CATER{% endblock %}
+{% block content %}
+<h1>多票批次</h1>
+<p class="muted">从本地 .eml 离线导入多票邮件，人工核对分票方案后显式确认建票。
+本阶段建出的任务保持挂起，不会自动处理或发信。</p>
+
+<form class="filters" method="post" action="/batches/import" enctype="multipart/form-data">
+  {% include "_csrf.html" %}
+  <label>导入 .eml
+    <input type="file" name="file" accept=".eml" required>
+  </label>
+  <button type="submit">离线导入批次</button>
+</form>
+
+{% if batches %}
+<table class="grid">
+  <thead>
+    <tr>
+      <th>状态</th><th>发起人</th><th>主题</th><th>方案数</th><th>任务数</th><th>导入时间</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in batches %}
+    <tr>
+      <td><span class="badge status-{{ item.status|lower }}">{{ item.status }}</span></td>
+      <td class="nowrap">{{ item.owner_name or item.owner }}</td>
+      <td><a href="/batches/{{ item.id }}">{{ item.subject or "(无主题)" }}</a>
+        <div class="muted mono">{{ item.id }}</div></td>
+      <td>{{ item.plan_count }}</td>
+      <td>{{ item.task_count }}</td>
+      <td class="nowrap">{{ item.created_at }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">还没有批次。请上传本地 .eml 文件导入。</p>
+{% endif %}
+{% endblock %}

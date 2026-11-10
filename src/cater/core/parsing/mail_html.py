@@ -290,7 +290,7 @@ def _is_business_table(table, aliases) -> bool:
 
 
 def _parse_table(table, table_index: int, message_id: Optional[str],
-                 aliases) -> tuple[list, list]:
+                 aliases, require_mso: bool = True) -> tuple[list, list]:
     """解析一张业务表：返回 (MailRow 列表, issue 列表)。"""
     grid = _logical_grid(table)
     header_row, plan, unknown = _find_header_plan(grid, aliases)
@@ -344,7 +344,13 @@ def _parse_table(table, table_index: int, message_id: Optional[str],
                 ))
                 fields = {}
                 break
-        if not fields.get("mso"):
+        if require_mso:
+            keep = bool(fields.get("mso"))
+        else:
+            # 预览分票等场景：MSO 缺列的行若带序列号同样保留，由调用方
+            # 按序列号映射/判歧；process_job 默认 require_mso=True 不变。
+            keep = bool(fields.get("mso") or fields.get("serial_number"))
+        if not keep:
             continue
         rows.append(MailRow(fields=fields, source=Source(
             type="mail_html", message_id=message_id, table_index=table_index, row=ri)))
@@ -383,7 +389,8 @@ def mail_has_business_table(html: str, text: str,
 
 
 def parse_mail_html(html: str, message_id: Optional[str],
-                    aliases: Optional[dict] = None) -> MailParseResult:
+                    aliases: Optional[dict] = None,
+                    require_mso: bool = True) -> MailParseResult:
     result = MailParseResult()
     resolved = mail_aliases(aliases)
     conflicts = check_alias_collisions(
@@ -437,7 +444,8 @@ def parse_mail_html(html: str, message_id: Optional[str],
         return result
     parsed = []
     for idx, t in candidates:
-        rows, issues = _parse_table(t, idx, message_id, resolved)
+        rows, issues = _parse_table(t, idx, message_id, resolved,
+                                    require_mso=require_mso)
         result.issues.extend(issues)
         parsed.append((idx, rows))
     first_sig = _rows_signature(parsed[0][1])
@@ -465,6 +473,57 @@ _TEXT_QUOTE_BOUNDARIES = (
 )
 
 
+def extract_mail_notes(html: str, text: str,
+                       max_lines: int = 5, max_length: int = 200) -> list:
+    """提取正文新写内容的开头业务说明行（审计展示用，不解析为字段）。
+
+    - HTML：剔除引用容器（与业务表解析同一套 _is_quoted 规则）与全部表格
+      后取纯文本；业务表内容不会混入说明行；
+    - 纯文本：剔除引用历史（_strip_text_quotes），在遇到业务表头行
+      （含 MSO 列别名）处停止，避免把表格表头当作说明；
+    - 行数与单行长度有界。返回的原文仅用于预览展示，不参与字段识别。
+    """
+    notes: list = []
+
+    def push(line: str) -> bool:
+        cleaned = " ".join(line.replace("\xa0", " ").split())
+        if not cleaned:
+            return False
+        notes.append(cleaned[:max_length])
+        return len(notes) >= max_lines
+
+    if html and "<" in html:
+        soup = BeautifulSoup(html, "lxml")
+        for element in list(soup.find_all(True)):
+            if element.attrs is None:
+                continue  # 已随引用容器整体 decompose
+            name = getattr(element, "name", None)
+            if name in QUOTE_CONTAINERS:
+                element.decompose()
+                continue
+            pid = element.get("id") or ""
+            if pid.startswith("lark-mail-quote") or pid.startswith("divRplyFwdMsg"):
+                element.decompose()
+                continue
+            cls = " ".join(element.get("class") or [])
+            if "gmail_quote" in cls or "OutlookMessageHeader" in cls:
+                element.decompose()
+        for table in soup.find_all("table"):
+            table.decompose()
+        for line in soup.get_text("\n").splitlines():
+            if push(line):
+                return notes
+        return notes
+    aliases = mail_aliases()
+    for line in _strip_text_quotes(text or ""):
+        cells = [c.strip() for c in re.split(r"\t|\s{2,}", line.strip()) if c.strip()]
+        if len(cells) >= 2 and "mso" in _resolve_header(cells, aliases).fields.values():
+            break
+        if push(line):
+            break
+    return notes
+
+
 def _strip_text_quotes(text: str) -> list[str]:
     """剔除纯文本引用历史（> 前缀行与常见引用边界之后的全部内容）。"""
     kept: list[str] = []
@@ -478,7 +537,8 @@ def _strip_text_quotes(text: str) -> list[str]:
 
 
 def parse_mail_text(text: str, message_id: Optional[str],
-                    aliases: Optional[dict] = None) -> MailParseResult:
+                    aliases: Optional[dict] = None,
+                    require_mso: bool = True) -> MailParseResult:
     """可明确分列的纯文本业务表：表头行含 MSO 业务列名，数据行以 Tab
     或 2+ 空格分列；引用历史行不参与。"""
     result = MailParseResult()
@@ -560,7 +620,11 @@ def parse_mail_text(text: str, message_id: Optional[str],
                 break
         if ambiguous:
             continue
-        if fields.get("mso"):
+        if require_mso:
+            keep = bool(fields.get("mso"))
+        else:
+            keep = bool(fields.get("mso") or fields.get("serial_number"))
+        if keep:
             rows.append(MailRow(fields=fields, source=Source(
                 type="mail_text", message_id=message_id, row=header_idx + off + 1)))
     result.rows = rows

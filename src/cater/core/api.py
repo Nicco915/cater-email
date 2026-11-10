@@ -8,6 +8,13 @@
   供上层做布局确认与回复正文展示（不含正文/秘密）。
 - ``import_machine_reference(path: str) -> list[dict]``：仅读机型库 Sheet1，
   供应用初始化本地机型表。
+- ``inspect_sources(request: dict) -> dict``：多票分票预览（阶段 1，见
+  split_preview.py）。只读识别工作簿业务区域与身份、关联正文业务行，
+  返回候选与冲突；不写模板、不改 ``process_job`` 单票契约。
+- 显式 ``confirmed_input``（阶段 3）：仅当请求携带经应用层可信哈希
+  核验的已确认快照负载时才走已确认解析路径（machine_confirmed /
+  kit_confirmed），sources 范围/完整性/schema 无法验证即拒绝
+  （``ConfirmedInputError``），绝不落回全父邮件；旧单票契约不变。
 """
 from __future__ import annotations
 
@@ -20,14 +27,17 @@ from typing import Optional
 import openpyxl
 
 from .models import FieldValue, Issue, Source
-from .parsing.headers import merged_aliases, normalize_header
-from .parsing.mail_html import (MAIL_DEFAULT_ALIASES, check_alias_collisions,
+from .parsing.headers import (alias_marker as headers_alias_marker,
+                              merged_aliases, normalize_header)
+from .parsing.mail_html import (MAIL_DEFAULT_ALIASES, MailRow,
+                                check_alias_collisions,
                                 mail_aliases, parse_mail_html, parse_mail_text)
 from .parsing.machine_wb import (INVOICE_NAME_KEYS, PACKING_NAME_KEYS,
                                  parse_machine_workbook, sniff_machine_workbook)
 from .parsing.parts import parse_parts_workbook
 from .parsing.workbook import (SUPPORTED_SUFFIXES, UnsupportedSourceError,
                                WorkbookDependencyError, load_workbook_pair)
+from .numbertext import normalize_identifier
 from .reconcile import reconcile_machines
 from .references import CountryIndex, MachineIndex
 from .template_writer import (MACHINE_COMM_SPEC, MACHINE_MATERIALS_SPEC,
@@ -45,6 +55,211 @@ OUTPUT_NAMES = {
 
 def _template_dir() -> Path:
     return Path(os.environ.get("CATER_TEMPLATE_DIR", _REPO_ROOT / "templates"))
+
+
+class ConfirmedInputError(Exception):
+    """已确认输入契约违反：schema/身份/完整性无法验证即拒绝处理。
+
+    属于技术拒绝（疑似篡改或拼装负载），不是业务等待；抛出前不生成任何
+    文件，调用方按失败如实记录，绝不落回全父邮件或旧单票路径继续。
+    """
+
+
+CONFIRMED_INPUT_SCHEMA = 1
+
+
+def _confirmed_fail(message: str) -> None:
+    raise ConfirmedInputError(f"已确认输入拒绝：{message}")
+
+
+def _source_file_hash(source: dict, index: int) -> str:
+    """重新计算源文件内容哈希（绝不信任调用方随附的 sha256 字段）。"""
+    raw_path = source.get("path") if isinstance(source, dict) else None
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        _confirmed_fail(f"sources[{index}] 缺少有效路径")
+    path = Path(raw_path)
+    try:
+        if not path.is_file():
+            _confirmed_fail(f"sources[{index}] 文件缺失：{path.name}")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        _confirmed_fail(f"sources[{index}] 文件不可读：{type(exc).__name__}")
+
+
+def _validate_confirmed_input(confirmed, sources: list) -> tuple[dict, list]:
+    """校验显式 confirmed_input 的 schema、候选身份与本票 sources 完整性。
+
+    通过后返回 (candidate, mail_rows)。任何结构/范围/完整性不符即抛
+    :class:`ConfirmedInputError`：确认冲突的候选不能靠传 confirmed_input
+    跳过人工确认；sources 必须与候选 source_refs 精确一致（按内容哈希，
+    不重不漏），防止借 confirmed_input 夹带或替换材料。
+    """
+    if not isinstance(confirmed, dict):
+        _confirmed_fail("confirmed_input 必须是对象")
+    schema = confirmed.get("schema_version")
+    if isinstance(schema, bool) or schema != CONFIRMED_INPUT_SCHEMA:
+        _confirmed_fail(f"不支持的 schema_version={schema!r}"
+                        f"（仅支持 {CONFIRMED_INPUT_SCHEMA}）")
+    candidate = confirmed.get("candidate")
+    if not isinstance(candidate, dict):
+        _confirmed_fail("candidate 缺失或不是对象")
+    kind = candidate.get("kind")
+    if kind not in ("machine", "parts"):
+        _confirmed_fail(f"候选业务类型非法：{kind!r}（仅支持 machine/parts）")
+    if candidate.get("needs_confirmation"):
+        _confirmed_fail("候选仍处于待人工确认状态，不能按已确认路径执行")
+    cand_issues = candidate.get("issues")
+    if cand_issues is not None:
+        if not isinstance(cand_issues, list) or any(
+                not isinstance(i, dict) for i in cand_issues):
+            _confirmed_fail("candidate.issues 结构非法")
+        blocking = [i for i in cand_issues if i.get("blocking", True)]
+        if blocking:
+            codes = ", ".join(sorted({str(i.get("code")) for i in blocking}))
+            _confirmed_fail(f"候选仍存在阻断问题（{codes}），不能按已确认路径执行")
+    refs = candidate.get("source_refs")
+    if not isinstance(refs, list) or not refs:
+        _confirmed_fail("候选缺少 source_refs 资产清单")
+    ref_hashes: list[str] = []
+    for index, ref in enumerate(refs):
+        sha = ref.get("sha256") if isinstance(ref, dict) else None
+        if not isinstance(sha, str) or len(sha.strip()) != 64:
+            _confirmed_fail(f"候选 source_refs[{index}] 的 sha256 缺失或非法")
+        ref_hashes.append(sha.strip().lower())
+    mail_rows = confirmed.get("mail_rows")
+    if not isinstance(mail_rows, list) or any(
+            not isinstance(r, dict) for r in mail_rows):
+        _confirmed_fail("mail_rows 缺失或结构非法")
+    for index, ref in enumerate(mail_rows):
+        fields = ref.get("fields")
+        if not isinstance(fields, dict) or any(
+                not isinstance(name, str) or not name
+                or not isinstance(value, str)
+                for name, value in fields.items()):
+            _confirmed_fail(f"mail_rows[{index}].fields 结构非法")
+        if not normalize_identifier(fields.get("mso")) and \
+                not normalize_identifier(fields.get("serial_number")):
+            _confirmed_fail(
+                f"mail_rows[{index}] 缺少 MSO/序列号，正文行身份不完整")
+    fingerprint = confirmed.get("source_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        _confirmed_fail("source_fingerprint 缺失或不是非空字符串")
+    got_hashes = sorted(_source_file_hash(src, i)
+                        for i, src in enumerate(sources))
+    if got_hashes != sorted(ref_hashes):
+        _confirmed_fail("sources 与已确认候选的资产清单不一致"
+                        "（缺失、夹带或内容被篡改），已拒绝继续")
+    return candidate, mail_rows
+
+
+def _confirmed_mail_rows(confirmed_rows: list, mail: dict) -> list:
+    """由快照冻结的已确认正文行直接构建 reconcile 输入（含来源定位）。
+
+    已确认路径不解析请求中的 mail 负载取内容：仅序列号票据的规范表可能
+    根本没有 MSO 列，无法被正文业务表识别；而冻结行本身就是经应用层可
+    信哈希核验的语义字段真值。直接使用冻结字段可在结构上杜绝 mail 负载
+    拼装/注入生效（篡改它对输出零影响），同时完整保留原表/行号溯源。
+    返回的是行副本（随后可做唯一配对 MSO 补认），可信快照绝不被修改。
+    """
+    mail = mail or {}
+    source_type = "mail_html" if mail.get("html") else "mail_text"
+    rows: list = []
+    for ref in confirmed_rows:
+        fields = {str(name): str(value)
+                  for name, value in ref["fields"].items()
+                  if value not in (None, "")}
+        rows.append(MailRow(fields=fields, source=Source(
+            type=source_type, message_id=mail.get("message_id"),
+            table_index=ref.get("table_index"), row=ref.get("row"))))
+    return rows
+
+
+def _canonical_confirmed_row(fields) -> tuple:
+    """正文行字段的规范化可比较形态：丢弃空值，键值全部字符串化。"""
+    if not isinstance(fields, dict):
+        _confirmed_fail("已确认正文行的 fields 结构非法")
+    return tuple(sorted(
+        (str(name), str(value)) for name, value in fields.items()
+        if value not in (None, "")))
+
+
+def _check_confirmed_mail(carrier_rows: list, confirmed_rows: list) -> None:
+    """正文载体的防拼装核对：可解析出业务行时必须与冻结行逐字段一致。
+
+    核对先于任何 MSO 补认，且始终针对快照冻结的原始字段。仅序列号票据
+    的规范表可能没有 MSO 列、根本不被业务表识别（零行），此时不消费载体
+    也不放行其内容——输出只由冻结行驱动（见 _confirmed_mail_rows），篡改
+    载体对输出零影响；一旦载体可解析（含 MSO 列空单元格的正常票据），
+    夹带/删改任何行或字段都会被此处拒绝。
+    """
+    if not carrier_rows:
+        return
+    parsed = sorted(_canonical_confirmed_row(r.fields) for r in carrier_rows)
+    confirmed = sorted(_canonical_confirmed_row(r.get("fields"))
+                       for r in confirmed_rows)
+    if parsed != confirmed:
+        _confirmed_fail("邮件正文与已确认正文行不一致（疑似篡改或拼装的 "
+                        "mail 负载），已拒绝继续")
+
+
+def _load_confirmed_machine_parser():
+    try:
+        from .parsing.machine_confirmed import parse_confirmed_machine_sources
+    except ImportError as exc:
+        raise ConfirmedInputError(
+            f"已确认整机解析组件不可用：{exc}") from exc
+    return parse_confirmed_machine_sources
+
+
+def _load_confirmed_kit_parser():
+    try:
+        from .parsing.kit_confirmed import parse_confirmed_kit_sources
+    except ImportError as exc:
+        raise ConfirmedInputError(
+            f"已确认配件解析组件不可用：{exc}") from exc
+    return parse_confirmed_kit_sources
+
+
+def _adopt_confirmed_msos(mail_rows: list, wb_result, issues: list) -> None:
+    """已确认整机路径：仅序列号正文行按已确认工作簿的唯一机器配对补认 MSO。
+
+    序列号 → MSO 的映射只来自已确认解析器（B）返回的本票机器清单；仅当
+    序列号唯一对应一个 MSO 时才在解析得到的行副本上补认（绝不修改可信
+    快照，行来源保持邮件来源不变）。无匹配/多候选/匹配机器无 MSO 一律
+    显式阻断，绝不默认取第一台。
+    """
+    by_serial: dict[str, dict[str, str]] = {}
+    for row in (list(wb_result.invoice_rows or [])
+                + list(wb_result.packing_rows or [])):
+        serial = normalize_identifier(getattr(row, "loader", None))
+        mso = getattr(row, "mso", None)
+        if not serial or not mso:
+            continue
+        by_serial.setdefault(serial, {})[normalize_identifier(mso)] = str(mso)
+    for row in mail_rows:
+        if normalize_identifier(row.fields.get("mso")):
+            continue  # 已有 MSO：一致性由 reconcile 正式核对
+        serial = normalize_identifier(row.fields.get("serial_number"))
+        if not serial:
+            continue
+        matches = by_serial.get(serial, {})
+        if len(matches) == 1:
+            row.fields["mso"] = next(iter(matches.values()))
+            continue
+        if not matches:
+            issues.append(Issue(
+                code="MAIL_ROW_SERIAL_UNMATCHED",
+                message=f"正文行序列号 {serial} 在已确认工作簿机器清单中"
+                        "不存在，无法补认 MSO",
+                sources=[row.source],
+                required_action="请核对正文行序列号与本票机器清单"))
+        else:
+            issues.append(Issue(
+                code="MAIL_ROW_SERIAL_AMBIGUOUS",
+                message=f"正文行序列号 {serial} 在已确认工作簿中对应多个 MSO "
+                        f"{sorted(matches)}，无法唯一补认，未采用任何一台",
+                sources=[row.source],
+                required_action="请核对序列号与 MSO 的对应关系"))
 
 
 def _content_hash(kind: str, destination: Optional[dict], records: list) -> str:
@@ -186,15 +401,8 @@ def canonical_structure(kind: str, layout: dict, alias_marker: str) -> dict:
 
 
 def _alias_marker(request_aliases) -> str:
-    """别名集标记：默认集固定版本号；自定义别名以其规范化并集哈希标记，
-    使别名配置变化体现为结构边界（且不含任何正文/秘密）。"""
-    if not request_aliases:
-        return "default-v1"
-    canonical = json.dumps(
-        {name: sorted(keys) for name, keys in sorted(request_aliases.items())},
-        ensure_ascii=False, sort_keys=True)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
-    return f"custom-{digest}"
+    """别名集标记（实现已统一到 parsing.headers.alias_marker）。"""
+    return headers_alias_marker(request_aliases)
 
 
 def _layout_block(kind: str, layout: dict, request_aliases=None) -> dict:
@@ -256,6 +464,20 @@ def process_job(request: dict) -> dict:
     for msg in machine_index.issues:
         issues.append(Issue(code="MACHINE_REFERENCE_CONFLICT", message=msg,
                             required_action="请通过管理页解决机型资料冲突"))
+
+    confirmed_input = request.get("confirmed_input")
+    if confirmed_input is not None:
+        # 阶段 3 显式已确认路径：先完整验证契约（schema/候选/本票资产完整
+        # 性），再按候选类型走已确认解析器（B/C），随后仍走既有
+        # reconcile/transform/模板输出与全部正式校验。任何验证失败直接
+        # 抛出 ConfirmedInputError 拒绝，绝不落回全父邮件或旧单票路径。
+        return _process_confirmed(
+            confirmed_input, task_id=task_id, kind=kind,
+            destination=destination, sources=sources, mail=mail,
+            country_index=country_index, machine_index=machine_index,
+            output_dir=output_dir, overrides=overrides, issues=issues,
+            header_aliases=header_aliases,
+            raw_aliases=request.get("header_aliases"))
 
     if kind == "auto":
         kind = _classify(sources, mail, header_aliases)
@@ -433,6 +655,14 @@ def _process_parts(task_id, destination, sources, country_index,
                                [Issue(code="UNSUPPORTED_FILE", message=str(exc),
                                       required_action="请补充 xlsx 或 xls 格式附件")],
                                [], [], None, _content_hash("parts", destination, []))
+    return _finish_parts(task_id, destination, parsed, country_index,
+                         output_dir, overrides, issues, raw_aliases)
+
+
+def _finish_parts(task_id, destination, parsed, country_index,
+                  output_dir, overrides, issues, raw_aliases=None) -> dict:
+    """配件处理公共尾段（旧单票与已确认路径共用）：正式核对、修正、
+    行构建、状态判定、模板输出与布局/溯源响应。"""
     issues.extend(parsed.issues)
 
     if destination is None:
@@ -579,6 +809,17 @@ def _process_machine(task_id, destination, sources, mail, country_index,
         else:
             issues.extend(mail_result.issues)
 
+    return _finish_machine(task_id, destination, wb_result, mail_rows,
+                           mail_result, supplement_rows, country_index,
+                           machine_index, output_dir, overrides, issues,
+                           raw_aliases)
+
+
+def _finish_machine(task_id, destination, wb_result, mail_rows, mail_result,
+                    supplement_rows, country_index, machine_index,
+                    output_dir, overrides, issues, raw_aliases=None) -> dict:
+    """整机处理公共尾段（旧单票与已确认路径共用）：缺表检查、reconcile、
+    修正、行构建、状态判定、模板输出与布局/溯源响应。"""
     if not mail_rows and not supplement_rows and (
             mail_result is None or mail_result.tables_seen == 0):
         issues.append(Issue(
@@ -650,6 +891,104 @@ def _process_machine(task_id, destination, sources, mail, country_index,
                            layout=layout)
 
 
+def _process_confirmed(confirmed, *, task_id, kind, destination, sources,
+                       mail, country_index, machine_index, output_dir,
+                       overrides, issues, header_aliases,
+                       raw_aliases=None) -> dict:
+    """显式已确认路径：可信快照（应用层已验哈希）驱动的单票转换。
+
+    - schema/候选/本票资产完整性由 :func:`_validate_confirmed_input` 核验，
+      不符即抛 :class:`ConfirmedInputError`（技术拒绝，不生成任何文件）；
+    - 工作簿解析走已确认解析器（machine_confirmed/kit_confirmed），按已
+      确认身份与区域逐项核对，绝不把 preview candidate.facts 当明细真值；
+    - 正文只取快照冻结的 mail_rows（经应用层可信哈希核验的语义字段），
+      由 :func:`_confirmed_mail_rows` 直接构建 reconcile 输入并保留原表/
+      行号溯源；随请求的正文载体只做防拼装核对（可解析出业务行时必须与
+      冻结原始字段逐字段一致，见 :func:`_check_confirmed_mail`），绝不读
+      父邮件补字段，也不走旧单票的附件挑选/歧义/补件邮件逻辑；
+    - 仅序列号正文行先以冻结原始字段为基线，其 MSO 只能按已确认解析器
+      返回的本票机器清单做唯一配对补认（无匹配/多候选显式阻断，绝不默认
+      取第一台）；legacy 单票路径 require_mso 默认保持不变；
+    - 之后的 reconcile、transform、模板 writer、status/layout/provenance
+      及金额/HS 等正式校验与旧路径完全一致（共享公共尾段）。
+    """
+    candidate, confirmed_rows = _validate_confirmed_input(confirmed, sources)
+    cand_kind = str(candidate.get("kind"))
+    if kind == "auto":
+        kind = cand_kind
+    if kind not in ("parts", "machine") or cand_kind != kind:
+        _confirmed_fail(f"请求业务类型 {kind!r} 与已确认候选 {cand_kind!r} 不一致")
+
+    if kind == "parts":
+        parse_confirmed = _load_confirmed_kit_parser()
+        try:
+            parsed = parse_confirmed(sources, candidate, confirmed_rows,
+                                     aliases=header_aliases)
+        except WorkbookDependencyError as exc:
+            issues.append(Issue(
+                code="WORKBOOK_DEPENDENCY",
+                message=f"附件已确认，但运行环境缺少解析所需组件：{exc}",
+                required_action="附件无需重发；请联系维护人员在运行环境"
+                                "安装缺失组件后重试本任务",
+            ))
+            return _build_response("waiting_input", "parts", [], issues, [], [],
+                                   None, _content_hash("parts", destination, []))
+        except UnsupportedSourceError as exc:
+            return _build_response("unsupported", "parts", [],
+                                   [Issue(code="UNSUPPORTED_FILE", message=str(exc),
+                                          required_action="请补充 xlsx 或 xls 格式附件")],
+                                   [], [], None,
+                                   _content_hash("parts", destination, []))
+        return _finish_parts(task_id, destination, parsed, country_index,
+                             output_dir, overrides, issues, raw_aliases)
+
+    parse_confirmed = _load_confirmed_machine_parser()
+    filename = next((str(s.get("filename")) for s in sources
+                     if isinstance(s, dict) and s.get("filename")), "")
+    try:
+        wb_result = parse_confirmed(sources, candidate, confirmed_rows,
+                                    aliases=header_aliases)
+    except WorkbookDependencyError as exc:
+        issues.append(Issue(
+            code="WORKBOOK_DEPENDENCY",
+            message=f"附件 {filename} 已确认，但运行环境缺少解析所需组件："
+                    f"{exc}",
+            sources=[Source(type="workbook", filename=filename)] if filename else [],
+            required_action="附件无需重发；请联系维护人员在运行环境"
+                            "安装缺失组件后重试本任务",
+        ))
+        return _build_response("waiting_input", "machine", [], issues,
+                               [], [], None,
+                               _content_hash("machine", destination, []))
+    except UnsupportedSourceError as exc:
+        return _build_response("unsupported", "machine", [],
+                               [Issue(code="UNSUPPORTED_FILE", message=str(exc),
+                                      required_action="请补充 xlsx 或 xls 格式附件")],
+                               [], [], None,
+                               _content_hash("machine", destination, []))
+    issues.extend(wb_result.issues)
+
+    mail_rows = _confirmed_mail_rows(confirmed_rows, mail)
+    # 防拼装逐字段核对（先于任何补认，针对冻结原始字段）：正文载体可解析
+    # 出业务行时必须与冻结行一致；仅序列号票的规范表无 MSO 列不可识别时
+    # 不消费载体。legacy 路径 require_mso 默认保持不变。
+    carrier_rows: list = []
+    if mail.get("html"):
+        carrier_rows = parse_mail_html(
+            mail["html"], mail.get("message_id"),
+            aliases=header_aliases, require_mso=False).rows
+    elif mail.get("text"):
+        carrier_rows = parse_mail_text(
+            mail["text"], mail.get("message_id"),
+            aliases=header_aliases, require_mso=False).rows
+    _check_confirmed_mail(carrier_rows, confirmed_rows)
+    # 仅序列号行：按 B 返回的唯一机器配对补认 MSO（多候选/无匹配阻断）。
+    _adopt_confirmed_msos(mail_rows, wb_result, issues)
+    return _finish_machine(task_id, destination, wb_result, mail_rows,
+                           None, [], country_index, machine_index,
+                           output_dir, overrides, issues, raw_aliases)
+
+
 def import_machine_reference(path: str) -> list:
     """从机型库工作簿 Sheet1 导入机型申报资料（不读 Sheet2）。
 
@@ -717,3 +1056,14 @@ def import_machine_reference(path: str) -> list:
             continue
         entries[key] = entry
     return list(entries.values())
+
+
+def inspect_sources(request: dict) -> dict:
+    """多票分票预览入口（阶段 1）：识别附件业务区域/身份并关联正文业务行。
+
+    委托 split_preview.inspect_sources；与 process_job 相同的只读工作簿
+    加载与安全上限，不触碰模板、数据库、网络或任何写入路径。
+    """
+    from .split_preview import inspect_sources as _inspect
+
+    return _inspect(request)

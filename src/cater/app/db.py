@@ -20,13 +20,23 @@ class Database:
     never happen inside :meth:`transaction`.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            str(self.path), check_same_thread=False, isolation_level=None, timeout=10
-        )
+        if connection is not None:
+            self._conn = connection
+            self._external = True
+        else:
+            self._conn = sqlite3.connect(
+                str(self.path), check_same_thread=False,
+                isolation_level=None, timeout=10,
+            )
+            self._external = False
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -151,6 +161,8 @@ class Database:
 
     def close(self) -> None:
         with self._lock:
+            if self._external:
+                return  # 外部连接的所有权归调用方（测试/并发注入）
             try:
                 self._conn.close()
             except sqlite3.Error:

@@ -1,5 +1,8 @@
 """表头规范化与语义列定位（plan/tasks/claude-flexible-input.md 阶段 2）。
 
+别名集版本标记（``alias_marker``）供核心公共入口（process_job 结构指纹、
+inspect_sources 预览指纹）统一标记所用别名配置。
+
 - 表头文本规范化：NFKC、大小写折叠、去空白/换行/标点，使
   ``U'weight/kg``、``NET WEIGHT (KGS)``、``SERIAL #``、``QTY.`` 等写法
   归一到同一键；
@@ -147,6 +150,21 @@ def merged_aliases(overrides: Optional[dict]) -> dict[str, tuple[str, ...]]:
                 merged.append(key)
         result[field_name] = tuple(merged)
     return result
+
+
+def alias_marker(request_aliases: Optional[dict]) -> str:
+    """别名集标记：默认集固定版本号；自定义别名以其规范化并集哈希标记，
+    使别名配置变化体现为结构边界（且不含任何正文/秘密）。"""
+    import hashlib
+    import json
+
+    if not request_aliases:
+        return "default-v1"
+    canonical = json.dumps(
+        {name: sorted(keys) for name, keys in sorted(request_aliases.items())},
+        ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"custom-{digest}"
 
 
 @dataclass

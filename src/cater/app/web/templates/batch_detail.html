@@ -1,0 +1,305 @@
+{% extends "base.html" %}
+{% block title %}批次 {{ batch.id }} · CATER{% endblock %}
+{% block content %}
+<h1>多票批次 <span class="mono">{{ batch.id }}</span></h1>
+
+<table class="grid">
+  <tbody>
+    <tr><th>状态</th><td><span class="badge status-{{ batch.status|lower }}">{{ batch.status }}</span>
+      {% if batch.status == 'materialized' %}<span class="muted">已按确认方案建票，方案已锁定</span>{% endif %}</td></tr>
+    <tr><th>发起人</th><td>{{ batch.owner_name or '' }} &lt;{{ batch.owner }}&gt;</td></tr>
+    <tr><th>主题</th><td>{{ batch.subject or '(无主题)' }}</td></tr>
+    <tr><th>Message-ID</th><td class="mono">{{ batch.message_id or '-' }}</td></tr>
+    <tr><th>邮件指纹</th><td class="mono">{{ batch.mail_hash }}</td></tr>
+    <tr><th>导入</th><td>{{ batch.created_at }}（{{ batch.created_by }}）</td></tr>
+    {% if batch.confirmed_at %}
+    <tr><th>确认</th><td>{{ batch.confirmed_at }}（{{ batch.confirmed_by }}）
+      指纹 <span class="mono">{{ batch.confirmed_fingerprint }}</span></td></tr>
+    {% endif %}
+  </tbody>
+</table>
+
+<h2>方案版本</h2>
+<div class="chips">
+  {% for p in plans %}
+    <a class="chip {% if plan and p.id == plan.id %}active{% endif %}" href="/batches/{{ batch.id }}?plan={{ p.id }}">
+      v{{ p.version }}{% if p.batch_ready %} ✓{% endif %}{% if p.id == batch.current_plan_id %} ·当前{% endif %}
+    </a>
+  {% endfor %}
+</div>
+
+{% if plan %}
+<p class="muted">方案 <span class="mono">{{ plan.id }}</span> · 识别器 {{ plan.inspector_version }} ·
+  指纹 <span class="mono">{{ plan.source_fingerprint }}</span> ·
+  {{ plan.created_at }}（{{ plan.created_by }}：{{ plan.reason or '识别' }}）·
+  batch_ready = <strong>{{ 'true' if plan.batch_ready else 'false' }}</strong></p>
+
+{% set blocking = preview.issues | selectattr('blocking') | list %}
+{% if blocking %}
+<h3>阻断问题（须调整归属或补充材料重新核对，不能一键忽略）</h3>
+<table class="grid">
+  <tbody>
+    {% for issue in blocking %}
+    <tr>
+      <td><span class="badge warn">{{ issue.code }}</span></td>
+      <td>{{ issue.message }}{% if issue.required_action %}<div class="muted">{{ issue.required_action }}</div>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if preview.unmatched_mail_rows %}
+<h3>未归属正文业务行（必须逐行指派到唯一候选，或有理由排除）</h3>
+<table class="grid">
+  <thead><tr><th>定位</th><th>内容</th><th>原因</th><th>处理</th></tr></thead>
+  <tbody>
+    {% for row in preview.unmatched_mail_rows %}
+    <tr>
+      <td class="nowrap">表 {{ row.table_index }} 第 {{ row.row }} 行</td>
+      <td>
+        {% for k, v in (row.fields or {}).items() %}<div><span class="muted">{{ k }}:</span> {{ v }}</div>{% endfor %}
+        {% if row.mso %}<div class="muted">MSO {{ row.mso }}</div>{% endif %}
+        {% if row.serial %}<div class="muted">序列号 {{ row.serial }}</div>{% endif %}
+      </td>
+      <td>{{ row.reason }}</td>
+      <td>
+        {% if batch.status == 'open' and plan.id == batch.current_plan_id %}
+        <form method="post" action="/batches/{{ batch.id }}/adjust" class="inline">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="base_plan_id" value="{{ plan.id }}">
+          <input type="hidden" name="op_type" value="mail_row">
+          <input type="hidden" name="table_index" value="{{ row.table_index }}">
+          <input type="hidden" name="row" value="{{ row.row }}">
+          <select name="action">
+            <option value="assign">指派到候选</option>
+            <option value="exclude">排除（非本批业务）</option>
+          </select>
+          <select name="candidate_id">
+            {% for cand in preview.candidates %}
+            <option value="{{ cand.candidate_id }}">{{ (cand.identity.invoice_no or cand.identity.mso or [cand.candidate_id[:12]]) | join(', ') }}</option>
+            {% endfor %}
+          </select>
+          <input type="text" name="reason" placeholder="理由（排除必填）" maxlength="200">
+          <button type="submit">应用并重新核对</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% set undecided_sources = preview.unmatched_sources | rejectattr('status', 'equalto', 'not_workbook') | list %}
+{% set passive_sources = preview.unmatched_sources | selectattr('status', 'equalto', 'not_workbook') | list %}
+{% if undecided_sources %}
+<h3>未归属/不可读附件（必须显式指派或有理由排除；无法读取的 Excel 不能默认忽略）</h3>
+<table class="grid">
+  <thead><tr><th>文件</th><th>状态</th><th>说明</th><th>处理</th></tr></thead>
+  <tbody>
+    {% for src in undecided_sources %}
+    <tr>
+      <td>{{ (src.filenames or [src.filename]) | join(', ') }}<div class="muted mono">{{ (src.sha256 or '')[:16] }}</div></td>
+      <td><span class="badge warn">{{ src.status }}</span></td>
+      <td>{{ src.reason }}</td>
+      <td>
+        {% if batch.status == 'open' and plan.id == batch.current_plan_id and src.sha256 %}
+        <form method="post" action="/batches/{{ batch.id }}/adjust" class="inline">
+          {% include "_csrf.html" %}
+          <input type="hidden" name="base_plan_id" value="{{ plan.id }}">
+          <input type="hidden" name="op_type" value="source">
+          <input type="hidden" name="sha256" value="{{ src.sha256 }}">
+          <select name="action">
+            {% if src.status == 'empty' %}<option value="assign">指派到候选</option>{% endif %}
+            <option value="exclude">排除（说明证据角色）</option>
+          </select>
+          {% if src.status == 'empty' %}
+          <select name="candidate_id">
+            {% for cand in preview.candidates %}
+            <option value="{{ cand.candidate_id }}">{{ (cand.identity.invoice_no or cand.identity.mso or [cand.candidate_id[:12]]) | join(', ') }}</option>
+            {% endfor %}
+          </select>
+          {% endif %}
+          <input type="text" name="reason" placeholder="理由（排除必填）" maxlength="200">
+          <button type="submit">应用并重新核对</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if passive_sources %}
+<details><summary>非工作簿附件（{{ passive_sources | length }}，需显式排除或确认仅为审计材料）</summary>
+<ul>
+  {% for src in passive_sources %}
+  <li>{{ (src.filenames or [src.filename]) | join(', ') }} <span class="muted">{{ src.reason }}</span>
+    {% if batch.status == 'open' and plan.id == batch.current_plan_id and src.sha256 %}
+    <form method="post" action="/batches/{{ batch.id }}/adjust" class="inline">
+      {% include "_csrf.html" %}
+      <input type="hidden" name="base_plan_id" value="{{ plan.id }}">
+      <input type="hidden" name="op_type" value="source">
+      <input type="hidden" name="sha256" value="{{ src.sha256 }}">
+      <input type="hidden" name="action" value="exclude">
+      <input type="text" name="reason" placeholder="理由（如：装饰图片/共用证据）" maxlength="200">
+      <button type="submit">排除</button>
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+</details>
+{% endif %}
+
+{% if preview.excluded_mail_rows or preview.excluded_sources %}
+<h3>已排除项（审计保留）</h3>
+<ul>
+  {% for row in preview.excluded_mail_rows %}
+  <li>正文行 表 {{ row.table_index }} 第 {{ row.row }} 行 — {{ row.reason }}</li>
+  {% endfor %}
+  {% for src in preview.excluded_sources %}
+  <li>附件 {{ (src.filenames or [src.filename]) | join(', ') }} — {{ src.reason }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<h2>候选票（{{ preview.candidates | length }}）</h2>
+{% set decisions = {} %}
+{% for row in candidate_rows %}{% set _ = decisions.update({row.candidate_key: row}) %}{% endfor %}
+
+{% if batch.status == 'open' and plan.id == batch.current_plan_id %}
+<form method="post" action="/batches/{{ batch.id }}/confirm">
+  {% include "_csrf.html" %}
+  <input type="hidden" name="plan_id" value="{{ plan.id }}">
+  <input type="hidden" name="fingerprint" value="{{ plan.source_fingerprint }}">
+{% endif %}
+
+{% for cand in preview.candidates %}
+{% set decision = decisions.get(cand.candidate_id) %}
+<table class="grid candidate">
+  <tbody>
+    <tr>
+      <th>候选</th>
+      <td class="mono">{{ cand.candidate_id }}
+        <span class="badge">{{ cand.kind }}</span>
+        {% if cand.needs_confirmation %}<span class="badge warn">需确认</span>{% endif %}
+        {% if decision and decision.decision == 'selected' %}<span class="badge">已选入</span>{% endif %}
+        {% if decision and decision.decision == 'excluded' %}<span class="badge warn">已排除</span>{% endif %}
+      </td>
+    </tr>
+    <tr><th>身份</th><td>
+      {% for name, values in cand.identity.items() %}
+        <div><span class="muted">{{ name }}:</span> {{ values | join(', ') }}</div>
+      {% endfor %}
+    </td></tr>
+    <tr><th>金额/数量/重量</th><td>
+      {% for name, fact in cand.facts.items() %}
+        <div><span class="muted">{{ name }}:</span>
+          {% if fact.conflict %}<span class="badge warn">冲突</span>
+            {% for v in fact.variants %}{{ v.value }}（{{ v.sources | length }} 来源）{% if not loop.last %} / {% endif %}{% endfor %}
+          {% else %}{{ fact.value }}{% endif %}
+        </div>
+      {% endfor %}
+    </td></tr>
+    <tr><th>附件与区域</th><td>
+      {% for ref in cand.source_refs %}
+        <div>{{ ref.filenames | join(', ') }}
+          <span class="muted mono">{{ ref.sha256[:16] }}</span>
+          {% if ref.assigned %}<span class="badge">人工指派</span>{% endif %}
+          <span class="muted">{% for r in ref.regions %}{{ r.sheet }}:{{ r.role }} {% endfor %}</span>
+        </div>
+      {% endfor %}
+      {% if cand.mail_row_refs %}
+        <div class="muted">正文行：
+          {% for ref in cand.mail_row_refs %}表 {{ ref.table_index }} 第 {{ ref.row }} 行{% if ref.assigned %}(指派){% endif %} {% endfor %}
+        </div>
+      {% endif %}
+    </td></tr>
+    {% if cand.issues %}
+    <tr><th>问题</th><td>
+      {% for issue in cand.issues %}
+        <div>{% if issue.blocking %}<span class="badge warn">{{ issue.code }}</span>{% else %}<span class="badge">{{ issue.code }}</span>{% endif %}
+          {{ issue.message }}</div>
+      {% endfor %}
+    </td></tr>
+    {% endif %}
+    {% if cand.checks %}
+    <tr><th>核对</th><td>
+      {% for check in cand.checks %}
+        <div><span class="muted">{{ check.rule }}:</span> {{ check.result }}
+          {% if check.detail %}<span class="muted">{{ check.detail }}</span>{% endif %}</div>
+      {% endfor %}
+    </td></tr>
+    {% endif %}
+    {% if batch.status == 'open' and plan.id == batch.current_plan_id %}
+    <tr><th>建票决定</th><td>
+      <label><input type="checkbox" name="selected" value="{{ cand.candidate_id }}"
+        {% if cand.needs_confirmation %}disabled{% endif %}> 选入建票</label>
+      {% if cand.needs_confirmation %}<span class="muted">（存在未解决问题，不能选入）</span>{% endif %}
+      <input type="text" name="excl_{{ cand.candidate_id }}" placeholder="不选入时必填排除理由" maxlength="200">
+    </td></tr>
+    {% endif %}
+  </tbody>
+</table>
+{% endfor %}
+
+{% if batch.status == 'open' and plan.id == batch.current_plan_id %}
+  <p class="muted">确认即按当前方案版本与指纹创建所选候选的逐票任务；每个候选必须显式选入或填写排除理由。
+    本阶段建出的任务保持挂起，不会自动处理或发信。</p>
+  <button type="submit">确认方案并创建逐票任务</button>
+</form>
+{% endif %}
+
+{% if tasks %}
+<h2>关联任务（{{ tasks | length }}，本阶段全部挂起）</h2>
+<table class="grid">
+  <thead><tr><th>任务</th><th>候选</th><th>状态</th><th>挂起原因</th></tr></thead>
+  <tbody>
+    {% for item in tasks %}
+    <tr>
+      <td><a href="/tasks/{{ item.task_id }}" class="mono">{{ item.task_id }}</a></td>
+      <td class="mono">{{ item.candidate_key }}</td>
+      <td><span class="badge status-{{ item.task_status|lower }}">{{ item.task_status }}</span></td>
+      <td>{{ item.hold_reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>批次材料（不可变，哈希校验）</h2>
+<table class="grid">
+  <thead><tr><th>角色</th><th>文件</th><th>大小</th><th>SHA-256</th><th></th></tr></thead>
+  <tbody>
+    {% for asset in assets %}
+    <tr>
+      <td>{{ asset.role }}</td>
+      <td>{{ asset.filename }}</td>
+      <td>{{ asset.size_bytes }}</td>
+      <td class="mono">{{ asset.sha256[:16] }}…</td>
+      <td><a href="/batches/{{ batch.id }}/assets/{{ asset.id }}">下载</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>批次事件</h2>
+<table class="grid">
+  <thead><tr><th>时间</th><th>动作</th><th>操作者</th><th>明细</th></tr></thead>
+  <tbody>
+    {% for event in events %}
+    <tr>
+      <td class="nowrap">{{ event.created_at }}</td>
+      <td>{{ event.action }}</td>
+      <td>{{ event.actor }}</td>
+      <td>{% if event.detail %}<details><summary>明细</summary><pre>{{ event.detail | jsonpretty }}</pre></details>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该批次还没有方案版本。</p>
+{% endif %}
+{% endblock %}

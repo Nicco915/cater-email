@@ -398,6 +398,238 @@ def cmd_process(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preview_tickets(args: argparse.Namespace) -> int:
+    """Offline multi-ticket split preview: local .eml -> JSON preview.
+
+    Deliberately bypasses AppService: no config/.env load, no database, no
+    task/outbox/cursor writes, no network, no template generation.
+    """
+    from .preview import PreviewError, preview_eml
+
+    eml_path = Path(args.eml)
+    try:
+        preview = preview_eml(eml_path, extra_sources=args.source or ())
+    except PreviewError as exc:
+        print(f"preview error: {exc}", file=sys.stderr)
+        return 1
+    text = json.dumps(preview, ensure_ascii=False, indent=2, default=_json_default)
+    if args.output:
+        out = Path(args.output)
+        resolved = out.resolve()
+        forbidden = {eml_path.resolve()} | {
+            Path(item).resolve() for item in args.source or ()
+        }
+        if resolved in forbidden:
+            print("preview error: --output must not overwrite an input file",
+                  file=sys.stderr)
+            return 1
+        if out.exists() and not args.overwrite:
+            print(f"preview error: {out} exists (pass --overwrite to replace it)",
+                  file=sys.stderr)
+            return 1
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n", encoding="utf-8")
+        print(f"preview written: {out} "
+              f"(candidates={preview['candidate_count']} "
+              f"batch_ready={preview['batch_ready']})")
+        return 0
+    print(text)
+    return 0
+
+
+def cmd_import_batch(args: argparse.Namespace) -> int:
+    """显式离线导入本地 .eml 为多票批次（写库；不联网、不收发邮件）。
+
+    与 preview-tickets 不同：本命令持久化批次/方案/材料，供 Web 人工
+    确认后建票；重复导入同一邮件只返回既有批次。
+    """
+    with _service(args) as service:
+        result = service.batches.import_eml_file(args.eml, actor="cli")
+    batch = result["batch"]
+    plan = result.get("plan")
+    payload = {
+        "batch_id": batch["id"],
+        "created": result["created"],
+        "status": batch["status"],
+        "owner": batch["owner"],
+        "subject": batch["subject"],
+        "plan_version": plan["version"] if plan else None,
+        "batch_ready": bool(plan["batch_ready"]) if plan else None,
+    }
+    if result["created"] and result.get("preview"):
+        payload["candidate_count"] = result["preview"]["candidate_count"]
+    if args.json:
+        _emit_json(payload)
+    else:
+        verb = "已导入新批次" if result["created"] else "邮件已存在，返回既有批次"
+        print(f"{verb}: {batch['id']} (owner={batch['owner']})")
+        if plan:
+            print(f"方案 v{plan['version']}  "
+                  f"batch_ready={bool(plan['batch_ready'])}")
+    return 0
+
+
+def cmd_batches(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        rows = service.batches.list_batches(limit=args.limit)
+    if args.json:
+        _emit_json(rows)
+    else:
+        _print_table(
+            ["批次号", "状态", "发起人", "主题", "方案数", "任务数", "导入时间"],
+            (
+                [
+                    item["id"],
+                    item["status"],
+                    item["owner"],
+                    _clean_cell(item.get("subject"), 30),
+                    item["plan_count"],
+                    item["task_count"],
+                    item["created_at"],
+                ]
+                for item in rows
+            ),
+        )
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        try:
+            detail = service.batches.batch_detail(
+                args.batch_id, plan_id=args.plan)
+        except KeyError:
+            print(f"Batch not found: {args.batch_id}", file=sys.stderr)
+            return 1
+    if args.json:
+        _emit_json(detail)
+        return 0
+    batch = detail["batch"]
+    plan = detail["plan"]
+    preview = detail["preview"] or {}
+    print(f"批次: {batch['id']}  状态: {batch['status']}  "
+          f"发起人: {batch['owner']}")
+    print(f"主题: {batch.get('subject') or '-'}  邮件哈希: {batch['mail_hash'][:16]}…")
+    if plan:
+        print(f"当前方案: v{plan['version']}  "
+              f"指纹: {str(plan['source_fingerprint'])[:16]}…  "
+              f"batch_ready={bool(plan['batch_ready'])}")
+    print(f"\n候选 ({len(preview.get('candidates', []))}):")
+    for cand in preview.get("candidates", []):
+        identity = cand.get("identity", {})
+        label = (identity.get("invoice_no") or identity.get("mso")
+                 or [cand["candidate_id"][:12]])
+        print(f"- {cand['candidate_id']} [{cand.get('kind')}] {label}  "
+              f"needs_confirmation={cand['needs_confirmation']}")
+    if preview.get("unmatched_mail_rows"):
+        print(f"\n未归属正文行: {len(preview['unmatched_mail_rows'])}")
+    if preview.get("unmatched_sources"):
+        print(f"未归属附件: {len(preview['unmatched_sources'])}")
+    blocking = [i for i in preview.get("issues", []) if i.get("blocking")]
+    if blocking:
+        print(f"\n阻断问题 ({len(blocking)}):")
+        for issue in blocking:
+            print(f"- [{issue.get('code')}] {issue.get('message')}")
+    if detail["tasks"]:
+        print(f"\n已建任务 ({len(detail['tasks'])}):")
+        for item in detail["tasks"]:
+            print(f"- {item['task_id']} <- {item['candidate_key']}  "
+                  f"hold={item['execution_hold']}")
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    with _service(args) as service:
+        try:
+            detail = service.batches.batch_detail(
+                args.batch_id, plan_id=args.plan)
+        except KeyError:
+            print(f"Batch not found: {args.batch_id}", file=sys.stderr)
+            return 1
+    if args.json:
+        _emit_json(detail)
+        return 0
+    batch = detail["batch"]
+    plan = detail["plan"]
+    preview = detail["preview"] or {}
+    print(f"批次: {batch['id']}  状态: {batch['status']}  "
+          f"发起人: {batch['owner']}")
+    print(f"主题: {batch.get('subject') or '-'}  邮件哈希: {batch['mail_hash'][:16]}…")
+    if plan:
+        print(f"当前方案: v{plan['version']}  "
+              f"指纹: {str(plan['source_fingerprint'])[:16]}…  "
+              f"batch_ready={bool(plan['batch_ready'])}")
+    print(f"\n候选 ({len(preview.get('candidates', []))}):")
+    for cand in preview.get("candidates", []):
+        identity = cand.get("identity", {})
+        label = (identity.get("invoice_no") or identity.get("mso")
+                 or [cand["candidate_id"][:12]])
+        print(f"- {cand['candidate_id']} [{cand.get('kind')}] {label}  "
+              f"needs_confirmation={cand['needs_confirmation']}")
+    if preview.get("unmatched_mail_rows"):
+        print(f"\n未归属正文行: {len(preview['unmatched_mail_rows'])}")
+    if preview.get("unmatched_sources"):
+        print(f"未归属附件: {len(preview['unmatched_sources'])}")
+    blocking = [i for i in preview.get("issues", []) if i.get("blocking")]
+    if blocking:
+        print(f"\n阻断问题 ({len(blocking)}):")
+        for issue in blocking:
+            print(f"- [{issue.get('code')}] {issue.get('message')}")
+    if detail["tasks"]:
+        print(f"\n已建任务 ({len(detail['tasks'])}):")
+        for item in detail["tasks"]:
+            print(f"- {item['task_id']} <- {item['candidate_key']}  "
+                  f"hold={item['execution_hold']}")
+    return 0
+
+
+def cmd_run_batch_offline(args: argparse.Namespace) -> int:
+    """已确认批次子任务的显式离线执行（阶段 3）。
+
+    刻意不走 _service()/AppService：最小离线配置（不读 .env/凭据），
+    不实例化网关/轮询/交付；只读任务/批次/参考状态，不写正式状态、
+    不释放 execution_hold、不建 outbox、不写生产 outputs。
+    """
+    from .batch_offline import BatchOfflineRunner, load_offline_config
+
+    config = load_offline_config(args.config, args.runtime)
+    runner = BatchOfflineRunner(config)
+    try:
+        try:
+            report = runner.run_task(
+                args.task_id, args.output_dir, actor="cli-offline")
+        except KeyError:
+            print(f"任务不存在或不属于已确认批次任务: {args.task_id}",
+                  file=sys.stderr)
+            return 1
+    finally:
+        runner.close()
+    if args.json:
+        _emit_json(report)
+    else:
+        print(f"任务: {report['task_id']}  状态: {report['status']}")
+        print(f"批次: {report.get('batch_id')}  候选: {report.get('candidate_key')}")
+        print(f"快照哈希: {str(report['snapshot']['trusted_hash'])[:16]}… "
+              f"(复核 {'一致' if report['snapshot']['verified_hash'] == report['snapshot']['trusted_hash'] else '不一致'})")
+        print(f"参考版本: {report['references']['version']}  "
+              f"参考哈希: {report['references']['sha256'][:16]}…")
+        if report.get("error"):
+            print(f"错误: {report['error']}")
+        for artifact in report.get("artifacts", []):
+            print(f"- 产物: {artifact['filename']}  "
+                  f"{artifact['size_bytes']} bytes  {artifact['sha256'][:16]}…")
+        blocking = [i for i in report.get("issues", []) if i.get("blocking")]
+        if blocking:
+            print(f"\n阻断问题 ({len(blocking)}):")
+            for issue in blocking:
+                print(f"- [{issue.get('code')}] {issue.get('message')}")
+        print(f"\n报告: {Path(report['output_dir']) / 'offline_report.json'}")
+        hold = report.get("task_state_after", {}).get("execution_hold")
+        print(f"execution_hold 保持: {hold}  正式状态未变: "
+              f"{report.get('state_unchanged')}")
+    return 0 if report["status"] in ("ready", "waiting_input", "unsupported") else 1
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
     with _service(args) as service:
         task = service.retry_task(args.task_id, actor="cli")
@@ -718,6 +950,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subject")
     p.add_argument("--body", default="")
     p.add_argument("--source", action="append", default=[], help="xlsx/msg/eml input (repeatable)")
+
+    p = command("preview-tickets", cmd_preview_tickets,
+                "Preview multi-ticket split from a local .eml (offline, no DB)")
+    p.add_argument("--eml", required=True, help="Local .eml file to inspect")
+    p.add_argument("--source", action="append", default=[],
+                   help="Extra workbook path to include (repeatable)")
+    p.add_argument("--output", help="Also write the preview JSON to this file")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Allow replacing an existing --output file")
+
+    p = command("import-batch", cmd_import_batch,
+                "Import a local .eml as a persisted multi-ticket batch (offline)")
+    p.add_argument("--eml", required=True, help="Local .eml file to import")
+
+    p = command("batches", cmd_batches, "List multi-ticket batches")
+    p.add_argument("--limit", type=int, default=100)
+
+    p = command("batch", cmd_batch, "Show multi-ticket batch detail")
+    p.add_argument("batch_id")
+    p.add_argument("--plan", help="Show a specific plan version id")
+
+    p = command("run-batch-offline", cmd_run_batch_offline,
+                "Run one confirmed batch task offline (explicit, isolated output)")
+    p.add_argument("task_id")
+    p.add_argument("--output-dir", required=True,
+                   help="New empty directory for the isolated outputs (never overwritten)")
 
     p = command("retry", cmd_retry, "Retry a RETRY_PENDING or FAILED task")
     p.add_argument("task_id")

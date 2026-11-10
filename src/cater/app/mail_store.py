@@ -26,9 +26,26 @@ class MailStore:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{raw_hash}.eml"
         if not path.exists():
-            temporary = path.with_suffix(".eml.tmp")
-            temporary.write_bytes(raw)
-            os.replace(temporary, path)
+            # 独占唯一暂存：并发 save_raw 同一 raw_hash 时，固定 .tmp 名
+            # 会互相抢占 replace 源（FileNotFoundError）或交叉写。
+            import secrets
+            temporary = path.with_name(
+                f"{path.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                with temporary.open("xb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.replace(temporary, path)
+                except FileNotFoundError:
+                    # 并发线程已发布同一内容：以已发布文件为准。
+                    pass
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             os.chmod(path, 0o600)
         except OSError:
