@@ -27,7 +27,7 @@ from starlette.templating import Jinja2Templates
 
 from .. import state
 from ..application import AppService
-from ..errors import CaterError
+from ..errors import CaterError, ValidationError
 from ..runner import PollingService
 from ..util import is_within, safe_filename, sha256_bytes, utc_now
 from .security import (
@@ -1118,6 +1118,160 @@ def create_app(
                 actor="web-admin",
             ),
             success="已确认方案并创建逐票任务（本阶段任务保持挂起，不执行）",
+        )
+
+    # ------------------------------------------------------------------
+    # per-ticket destination confirmation (阶段 4：每票独立确认)
+    # ------------------------------------------------------------------
+    def destination_service():
+        # lazy import: the service is owned by the F workstream; the web layer
+        # only composes the frozen public interface with the existing services.
+        from ..batch_destinations import BatchDestinationService
+
+        return BatchDestinationService(
+            service.db, service.references, service.tasks, service.logger
+        )
+
+    def posted_single(form: Any, name: str) -> str:
+        """Read exactly one posted value; duplicates are rejected, never
+        silently de-duplicated (that would hide an ambiguous selection)."""
+        values = [str(value) for value in form.getlist(name)]
+        if len(values) > 1:
+            raise ValidationError(f"字段 {name} 重复提交，已拒绝本次确认")
+        return values[0] if values else ""
+
+    def _destination_error(
+        batch_id: str, exc: Exception, *, form_page: bool = False
+    ) -> RedirectResponse:
+        message = str(exc)
+        # Keep flash messages small and free of unrelated row detail.
+        if len(message) > 300:
+            message = message[:299] + "…"
+        path = (f"/batches/{batch_id}/destinations" if form_page
+                else f"/batches/{batch_id}")
+        return flash_redirect(path, error=message)
+
+    @app.get("/batches/{batch_id}/destinations", response_class=HTMLResponse)
+    def batch_destinations_page(request: Request, batch_id: str):
+        batch = _batch_or_404(batch_id)
+        try:
+            data = destination_service().get_batch_destinations(batch_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        except CaterError as exc:
+            return _destination_error(batch_id, exc)
+        except ValueError as exc:
+            return _destination_error(batch_id, exc)
+        return render(
+            request,
+            "batch_destinations.html",
+            batch=batch,
+            destinations=data,
+            rows=data.get("rows") or [],
+        )
+
+    @app.post("/batches/{batch_id}/destinations")
+    async def batch_destinations_confirm(request: Request, batch_id: str):
+        form = await form_data(request)
+        verify_csrf(request, form)
+        _batch_or_404(batch_id)
+        try:
+            data = destination_service().get_batch_destinations(batch_id)
+            rows = list(data.get("rows") or [])
+            by_task = {str(row.get("task_id")): row for row in rows}
+
+            selected = [
+                str(value).strip()
+                for value in form.getlist("selected")
+                if str(value).strip()
+            ]
+            if not selected:
+                raise ValidationError("请至少勾选一张要确认目的国的票")
+            if len(selected) != len(set(selected)):
+                raise ValidationError("勾选的票有重复，已拒绝本次确认（不会去重后提交）")
+            unknown = [task_id for task_id in selected if task_id not in by_task]
+            if unknown:
+                raise ValidationError(
+                    "所选票不属于该批次或已失效：请刷新页面后重新选择，未修改任何票")
+
+            bulk_country = posted_single(form, "bulk_country").strip()
+            plan_id = posted_single(form, "plan_id").strip()
+            if not plan_id:
+                raise ValidationError("确认方案版本缺失：请刷新页面后重试")
+            reference_raw = posted_single(form, "reference_version").strip()
+            if not re.fullmatch(r"\d+", reference_raw):
+                raise ValidationError("参考资料版本标识缺失或无效：请刷新页面后重试")
+            reason = posted_single(form, "reason").strip()
+            if not reason:
+                raise ValidationError("必须填写目的国确认理由（可审计）")
+            if len(reason) > 500:
+                raise ValidationError("目的国确认理由过长（最多 500 字）")
+
+            updates: list[dict[str, Any]] = []
+            for task_id in selected:
+                row_country = posted_single(form, f"country_{task_id}").strip()
+                if bulk_country:
+                    if row_country:
+                        raise ValidationError(
+                            "同一票同时提交了逐票国家与统一国家，已拒绝；"
+                            "请只保留一种选择方式")
+                    country = bulk_country
+                else:
+                    if not row_country:
+                        raise ValidationError(
+                            "勾选的票必须显式选择国家（不会套用批次默认值）")
+                    country = row_country
+                revision_raw = posted_single(form, f"revision_{task_id}").strip()
+                if not re.fullmatch(r"\d+", revision_raw):
+                    raise ValidationError(
+                        "所选票的修订标识缺失或无效：请刷新页面后重试，未修改任何票")
+                updates.append(
+                    {
+                        "task_id": task_id,
+                        "country": country,
+                        "expected_revision": int(revision_raw),
+                    }
+                )
+
+            destination_service().confirm_destinations(
+                batch_id,
+                plan_id=plan_id,
+                updates=updates,
+                actor="web-admin",
+                reason=reason,
+                expected_reference_version=int(reference_raw),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Batch or plan not found")
+        except CaterError as exc:
+            return _destination_error(batch_id, exc, form_page=True)
+        except ValueError as exc:
+            return _destination_error(batch_id, exc, form_page=True)
+        except HTTPException:
+            raise
+        except Exception as exc:  # log detail, show a safe summary
+            service.logger.exception(
+                "web_batch_destinations_failed", exc, batch_id=batch_id)
+            return _destination_error(
+                batch_id, f"{type(exc).__name__}: 目的国确认失败",
+                form_page=True)
+
+        try:
+            fresh = destination_service().get_batch_destinations(batch_id)
+            latest = {str(row.get("task_id")): row for row in fresh.get("rows") or []}
+            labels = []
+            for task_id in selected:
+                row = latest.get(task_id) or {}
+                label = row.get("candidate_key") or task_id
+                name = row.get("destination_name") or "未知"
+                alpha3 = row.get("destination_alpha3") or "-"
+                labels.append(f"{label}→{name}({alpha3})")
+            summary = "；".join(labels)
+        except Exception:  # confirmation already committed; only the summary is best-effort
+            summary = f"{len(selected)} 票"
+        return flash_redirect(
+            f"/batches/{batch_id}/destinations",
+            message=f"已确认所选举票目的国：{summary}",
         )
 
     @app.get("/batches/{batch_id}/assets/{asset_id}")

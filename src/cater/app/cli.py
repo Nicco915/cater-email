@@ -630,6 +630,180 @@ def cmd_run_batch_offline(args: argparse.Namespace) -> int:
     return 0 if report["status"] in ("ready", "waiting_input", "unsupported") else 1
 
 
+def cmd_batch_destinations(args: argparse.Namespace) -> int:
+    """只读展示批次每票目的国与最近确认来源（纯离线，不执行核心）。
+
+    刻意不走 _service()/AppService：只读 config.toml 的 runtime.dir 与
+    core.header_aliases，不读取 .env/OS 凭据，不创建网关或轮询器。
+    """
+    from .batch_destinations import BatchDestinationService
+    from .batch_offline import BatchOfflineRunner, load_offline_config
+
+    runner = BatchOfflineRunner(load_offline_config(args.config, args.runtime))
+    try:
+        try:
+            data = BatchDestinationService(
+                runner.db, runner.references, runner.tasks, runner.logger
+            ).get_batch_destinations(args.batch_id)
+        except KeyError:
+            print(f"批次不存在: {args.batch_id}", file=sys.stderr)
+            return 1
+    finally:
+        runner.close()
+    if args.json:
+        _emit_json(data)
+        return 0
+    print(f"批次: {data.get('batch_id')}  确认方案: {data.get('plan_id')}  "
+          f"参考版本: {data.get('reference_version')}")
+    _print_table(
+        ["任务号", "票号 / 候选", "目的国", "代码", "修订", "确认人", "确认时间",
+         "状态", "hold"],
+        (
+            [
+                row.get("task_id"),
+                row.get("ticket_no") or row.get("candidate_key"),
+                row.get("destination_name") or "未设置",
+                row.get("destination_alpha3") or "-",
+                row.get("revision"),
+                row.get("confirmed_by") or "-",
+                row.get("confirmed_at") or "-",
+                row.get("task_status"),
+                "1" if row.get("execution_hold") else "0",
+            ]
+            for row in data.get("rows") or []
+        ),
+    )
+    print("\n本命令只读，不确认、不执行、不改任务状态。"
+          "如要确认请使用 confirm-batch-destinations。")
+    return 0
+
+
+def cmd_confirm_batch_destinations(args: argparse.Namespace) -> int:
+    """显式确认所选票目的国（纯离线事务；不自动执行离线转换）。
+
+    先读取当前批次/方案/逐票修订，再把所选票一次性提交给 F 服务在事务内
+    复核。任何一票非法则整批零写入；输出逐票确认结果并以正确 exit 反映。
+    """
+    from .batch_destinations import BatchDestinationService
+    from .batch_offline import BatchOfflineRunner, load_offline_config
+
+    task_ids = [str(item).strip() for item in args.task_id]
+    if any(not task_id for task_id in task_ids):
+        print("错误：--task-id 不能为空", file=sys.stderr)
+        return 1
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for task_id in task_ids:
+        if task_id in seen:
+            duplicates.add(task_id)
+        else:
+            seen.add(task_id)
+    if duplicates:
+        # Never silently de-duplicate a client argument: a duplicate selection
+        # usually means a scripting/selection mistake and must be surfaced.
+        print("错误：--task-id 重复指定同一票（不会自动去重掩盖选择问题）："
+              + ", ".join(sorted(duplicates)), file=sys.stderr)
+        return 1
+    country = str(args.country or "").strip()
+    reason = str(args.reason or "").strip()
+    if not country:
+        print("错误：--country 不能为空（使用启用国家的代码或别名）", file=sys.stderr)
+        return 1
+    if not reason:
+        print("错误：--reason 不能为空（逐票审计需要明确业务理由）", file=sys.stderr)
+        return 1
+    if len(reason) > 500:
+        print("错误：--reason 过长（最多 500 字）", file=sys.stderr)
+        return 1
+
+    runner = BatchOfflineRunner(load_offline_config(args.config, args.runtime))
+    try:
+        destination_service = BatchDestinationService(
+            runner.db, runner.references, runner.tasks, runner.logger)
+        try:
+            data = destination_service.get_batch_destinations(args.batch_id)
+        except KeyError:
+            print(f"批次不存在: {args.batch_id}", file=sys.stderr)
+            return 1
+        rows_by_task = {
+            str(row.get("task_id")): row for row in data.get("rows") or []
+        }
+        missing = [task_id for task_id in task_ids if task_id not in rows_by_task]
+        if missing:
+            print("错误：所选票不属于该批次或不存在（未修改任何票）："
+                  + ", ".join(missing), file=sys.stderr)
+            return 1
+        updates = [
+            {
+                "task_id": task_id,
+                "country": country,
+                "expected_revision": int(rows_by_task[task_id].get("revision") or 0),
+            }
+            for task_id in task_ids
+        ]
+        try:
+            destination_service.confirm_destinations(
+                args.batch_id,
+                plan_id=str(data.get("plan_id")),
+                updates=updates,
+                actor="cli",
+                reason=reason,
+                expected_reference_version=int(data.get("reference_version")),
+            )
+        except KeyError:
+            print("错误：批次或确认方案不存在（未修改任何票）", file=sys.stderr)
+            return 1
+        try:
+            fresh = destination_service.get_batch_destinations(args.batch_id)
+        except KeyError:
+            fresh = {"rows": []}
+        latest = {str(row.get("task_id")): row for row in fresh.get("rows") or []}
+        results = []
+        for task_id in task_ids:
+            row = latest.get(task_id) or rows_by_task.get(task_id) or {}
+            results.append(
+                {
+                    "task_id": task_id,
+                    "candidate_key": row.get("candidate_key"),
+                    "destination_name": row.get("destination_name"),
+                    "destination_alpha3": row.get("destination_alpha3"),
+                    "revision": row.get("revision"),
+                    "confirmed_by": row.get("confirmed_by"),
+                    "confirmed_at": row.get("confirmed_at"),
+                    "task_status": row.get("task_status"),
+                    "execution_hold": row.get("execution_hold"),
+                }
+            )
+    finally:
+        runner.close()
+
+    if args.json:
+        _emit_json(
+            {
+                "batch_id": args.batch_id,
+                "plan_id": data.get("plan_id"),
+                "reference_version": data.get("reference_version"),
+                "confirmed": results,
+            }
+        )
+        return 0
+    print(f"已确认 {len(results)} 票目的国（批次 {args.batch_id}，"
+          f"方案 {data.get('plan_id')}）")
+    for item in results:
+        print(
+            f"- {item['task_id']} [{item.get('candidate_key') or '-'}] -> "
+            f"{item.get('destination_name') or '未知'}"
+            f"({item.get('destination_alpha3') or '-'})  "
+            f"修订={item.get('revision')}  "
+            f"确认人={item.get('confirmed_by') or '-'}  "
+            f"时间={item.get('confirmed_at') or '-'}  "
+            f"状态={item.get('task_status')}  hold={bool(item.get('execution_hold'))}"
+        )
+    print("任务状态/版本/execution_hold 未改变；未自动执行离线核心。"
+          "需要离线转换请另行显式运行 run-batch-offline。")
+    return 0
+
+
 def cmd_retry(args: argparse.Namespace) -> int:
     with _service(args) as service:
         task = service.retry_task(args.task_id, actor="cli")
@@ -970,6 +1144,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("batch", cmd_batch, "Show multi-ticket batch detail")
     p.add_argument("batch_id")
     p.add_argument("--plan", help="Show a specific plan version id")
+
+    p = command("batch-destinations", cmd_batch_destinations,
+                "Show per-ticket destination confirmations (offline, read-only)")
+    p.add_argument("batch_id")
+
+    p = command("confirm-batch-destinations", cmd_confirm_batch_destinations,
+                "Explicitly confirm selected tickets' destination (offline)")
+    p.add_argument("batch_id")
+    p.add_argument("--task-id", dest="task_id", action="append", required=True,
+                   help="Ticket task id to confirm (repeatable; duplicates rejected)")
+    p.add_argument("--country", required=True,
+                   help="Enabled country code or resolvable alias (e.g. FRA)")
+    p.add_argument("--reason", required=True,
+                   help="Auditable business reason (required, max 500 chars)")
 
     p = command("run-batch-offline", cmd_run_batch_offline,
                 "Run one confirmed batch task offline (explicit, isolated output)")

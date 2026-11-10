@@ -66,11 +66,13 @@
    缺参考时保持 `waiting_input`（如 `MISSING_DESTINATION`、
    `UNKNOWN_MODEL`、`UNKNOWN_COUNTRY`），**不降级猜测**。
 5. **任务目的国已由受控业务输入确认**：离线执行只读取任务自身
-   `destination_name/destination_alpha3`。**阶段 3 没有新增设置目的国的
-   CLI/Web 入口**；批次建票时目的国通常为空。此时离线执行会返回
-   `waiting_input`（`MISSING_DESTINATION`），这是预期的诚实结果。
-   需先通过协调者批准的受控流程在任务上确认目的国后重跑；禁止手工改库
-   或让离线执行按正文/父邮件猜国。该缺口属于后续释放/确认阶段。
+   的目的国确认来源（报告 `destination` 字段含确认人/时间/修订）。
+   **阶段 4 已提供逐票目的国确认入口**（Web `GET/POST
+   /batches/{id}/destinations`；CLI `batch-destinations` /
+   `confirm-batch-destinations`），见 `docs/multi-ticket-destinations.md`。
+   未确认的票目的国为空，离线执行返回 `waiting_input`
+   （`MISSING_DESTINATION`），这是预期的诚实结果；禁止手工改库或让
+   离线执行按正文/父邮件猜国。
 6. **业务输入已人工确认**：金额、HS、数量、重量、目的国均以已确认任务/
    快照/参考资料为准；离线执行不替代业务确认，也不提供“修改后即 ready”
    的旁路。
@@ -163,6 +165,7 @@ python -m cater.app.cli run-batch-offline <task_id> \
 | --- | --- |
 | `schema` | 报告 schema（当前 1）|
 | `task_id`/`batch_id`/`plan_id`/`candidate_key` | 本次执行身份 |
+| `destination` | 本票目的国确认来源：`name`/`alpha3`/`revision`/`confirmed_by`/`confirmed_at`（阶段 4 确认记录；未确认则为空值、revision 0，绝不猜测）|
 | `snapshot.path`/`trusted_hash`/`verified_hash`/`payload_hash` | 快照路径、数据库可信哈希、复核哈希、实际消费 payload 哈希（必须一致）|
 | `references.version`/`sha256` | 本次读取的参考资料版本与内容哈希 |
 | `task_state_before`/`task_state_after` | 执行前后任务状态/版本/hold |
@@ -270,10 +273,12 @@ TOTAL 行与箱单/发票一致。验收时重开台账，用数量×单价回�
 
 ## 6. 限制与已知边界
 
-- 仅 CLI/服务调用，不新增 Web 执行按钮；Web 保持阶段 2 的批次确认界面。
+- 仅 CLI/服务调用，不新增 Web 执行按钮；Web 保持阶段 2 的批次确认界面
+  （阶段 4 另提供逐票目的国确认页，不执行核心）。
 - 无批次确认 CLI；确认沿用 Web/服务端确认边界。
-- **无设置任务目的国的新增入口**：批次建票目的国为空时只能
-  `waiting_input`；需后续释放/确认阶段或经批准的受控维护流程设置。
+- 设置任务目的国的入口在**阶段 4**（`docs/multi-ticket-destinations.md`）：
+  逐票显式确认，未确认的票只能 `waiting_input`；目的国确认不自动执行
+  离线转换。
 - 不释放 hold、不自动重试、不批量处理、不接 poller、不发信、不创建
   outbox；不改变正式任务状态。
 - 一次调用只执行一票；没有批量/队列入口。
@@ -302,6 +307,9 @@ TOTAL 行与箱单/发票一致。验收时重开台账，用数量×单价回�
 ## 8. 验收测试与真实样本回放
 
 独立验收测试：`tests/app/test_stage3_acceptance.py`（全合成数据）。
+阶段 4 目的国确认链路的独立验收在
+`tests/app/test_stage4_acceptance.py`，运行方式与覆盖清单见
+`docs/multi-ticket-destinations.md` 第 8 节。
 
 ```bash
 cd /tmp
@@ -355,7 +363,7 @@ env -u CATER_IMAP_SSL -u CATER_IMAP_HOST -u CATER_FOLDER \
 | `任务不存在或不属于已确认批次任务` | task_id 错误或该票不是已确认批次子任务；用 `batch <id>` 核对。 |
 | `输出目录已存在` / `已被并发创建` | 换一个新的空目录；不覆盖、不混写。 |
 | `快照复核哈希与任务可信哈希不一致` / `TOCTOU` | 快照被替换/漂移；停止执行，保留现场并上报，不手工改快照或改库。 |
-| `MISSING_DESTINATION` | 任务目的国为空；按受控流程确认目的国后重跑（本阶段无新增设置入口）。 |
+| `MISSING_DESTINATION` | 任务目的国未确认；按阶段 4 手册（`docs/multi-ticket-destinations.md`）经 Web/CLI 逐票确认后，换新输出目录重跑。 |
 | `UNKNOWN_MODEL` | 机型库无匹配或 scope 被禁用；维护显式参考/别名，不模糊猜测。 |
 | `UNKNOWN_COUNTRY` | 目的国/原产国无法映射；补充受控国家别名。 |
 | `TEMPLATE_ERROR` | 模板缺失/损坏；恢复 `templates/` 三个文件。 |
@@ -365,8 +373,10 @@ env -u CATER_IMAP_SSL -u CATER_IMAP_HOST -u CATER_FOLDER \
 ## 10. 与阶段 2/后续阶段的边界
 
 - 阶段 2：导入、方案版本、人工确认、建 hold 任务、快照可信哈希；
-- 阶段 3（本文件）：显式离线执行与报告，不释放 hold、不发信、不写正式
-  状态/outbox；
-- 后续阶段：释放 hold、目的国/业务确认入口、批量/自动执行、交付外发、
-  失败重试 UI、逐字段 provenance 展示。这些均**未实现**，不得用本阶段
-  离线输出冒充已释放或已交付。
+- 阶段 4：逐票显式目的国确认（Web/CLI，见
+  `docs/multi-ticket-destinations.md`），只写目的国与逐票审计；
+- 阶段 3（本文件）：显式离线执行与报告（报告含目的国确认来源追溯），
+  不释放 hold、不发信、不写正式状态/outbox；
+- 后续阶段：释放 hold、批量/自动执行、交付外发、失败重试 UI、逐字段
+  provenance 展示。这些均**未实现**，不得用本阶段离线输出冒充已释放或
+  已交付。

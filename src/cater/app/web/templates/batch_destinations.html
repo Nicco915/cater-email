@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}确认目的国 · 批次 {{ batch.id }} · CATER{% endblock %}
+{% block content %}
+<h1>确认每票目的国 <span class="mono">{{ batch.id }}</span></h1>
+
+<p><a class="button" href="/batches/{{ batch.id }}">返回批次详情</a></p>
+
+<p class="muted">
+  这里按票独立确认目的国，不存在批次默认国家，也不会自动勾选任何票。
+  只有显式勾选并选择国家的票会被修改，未勾选的票保持不变。
+  确认只写入目的国与逐票审计记录，不改变任务状态、版本或 <span class="mono">execution_hold</span>，
+  也不会自动执行离线转换。
+</p>
+
+{% if not rows %}
+<p class="empty">该批次当前没有可确认目的国的子任务。</p>
+{% else %}
+<form method="post" action="/batches/{{ batch.id }}/destinations" autocomplete="off">
+  {% include "_csrf.html" %}
+  <input type="hidden" name="plan_id" value="{{ destinations.plan_id }}">
+  <input type="hidden" name="reference_version" value="{{ destinations.reference_version }}">
+
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>选择</th>
+        <th>票号 / 候选</th>
+        <th>当前目的国</th>
+        <th>最近确认（确认人 / 时间 / 修订）</th>
+        <th>本次目的国</th>
+        <th>任务状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>
+          <input type="checkbox" name="selected" value="{{ row.task_id }}"
+                 aria-label="选择票 {{ row.task_id }}">
+        </td>
+        <td>
+          <a href="/tasks/{{ row.task_id }}" class="mono">{{ row.ticket_no or row.candidate_key }}</a>
+          <div class="muted mono">{{ row.task_id }}</div>
+          <div class="muted mono">{{ row.candidate_key }}</div>
+        </td>
+        <td>
+          {% if row.destination_alpha3 %}
+            <strong>{{ row.destination_name or row.destination_alpha3 }}</strong>
+            <span class="badge mono">{{ row.destination_alpha3 }}</span>
+          {% else %}
+            <span class="badge warn">未设置（空值）</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.revision %}
+            <div>{{ row.confirmed_by or '-' }} · {{ row.confirmed_at or '-' }}</div>
+            <div class="muted">修订 <span class="mono">#{{ row.revision }}</span></div>
+          {% else %}
+            <span class="muted">尚无目的国确认记录（修订 0）</span>
+          {% endif %}
+        </td>
+        <td>
+          <select name="country_{{ row.task_id }}">
+            <option value="">— 不修改 / 请选择 —</option>
+            {% for country in destinations.countries %}
+            <option value="{{ country.alpha3 }}">{{ country.name_zh }}（{{ country.alpha3 }}）</option>
+            {% endfor %}
+          </select>
+          <input type="hidden" name="revision_{{ row.task_id }}" value="{{ row.revision }}">
+        </td>
+        <td>
+          <span class="badge status-{{ row.task_status|lower }}">{{ row.task_status }}</span>
+          {% if row.execution_hold %}<span class="badge warn">hold</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>批量同国（可选）</h2>
+  <p class="muted">
+    勾选上方若干票后使用本项，可让这些票统一使用同一个国家；本项默认留空，
+    不预选任何国家。若留空，则按上方每票自己的选择提交。同一张票同时填写
+    逐票国家和统一国家会被明确拒绝，不会悄悄覆盖其中一种选择。
+  </p>
+  <div class="filters">
+    <label>统一国家
+      <select name="bulk_country">
+        <option value="">（不启用，按逐票选择）</option>
+        {% for country in destinations.countries %}
+        <option value="{{ country.alpha3 }}">{{ country.name_zh }}（{{ country.alpha3 }}）</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>确认理由（必填，写入逐票审计）
+      <input type="text" name="reason" maxlength="500" required
+             placeholder="例如：客户邮件明确要求改发法国">
+    </label>
+  </div>
+  <p class="muted">
+    提交时服务端会在同一事务内再次复核批次、确认方案、所选票归属、挂起状态、
+    当前修订、国家启用状态与参考资料版本；任一票过期或非法则整批不写入。
+  </p>
+  <button type="submit">确认所选票目的国</button>
+</form>
+{% endif %}
+{% endblock %}

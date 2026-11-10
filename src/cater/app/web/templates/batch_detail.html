@@ -19,6 +19,13 @@
   </tbody>
 </table>
 
+{% if batch.status == 'materialized' %}
+<p class="actions">
+  <a class="button" href="/batches/{{ batch.id }}/destinations">确认目的国（逐票）</a>
+  <span class="muted">每票独立确认，可勾选若干票统一同一国家；未选票不变，任务保持挂起。</span>
+</p>
+{% endif %}
+
 <h2>方案版本</h2>
 <div class="chips">
   {% for p in plans %}

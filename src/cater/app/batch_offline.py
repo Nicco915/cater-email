@@ -238,6 +238,44 @@ class BatchOfflineRunner:
     # ------------------------------------------------------------------
     # public entry
     # ------------------------------------------------------------------
+    def _destination_confirmation(
+        self, batch_id: str, task_id: str
+    ) -> dict[str, Any]:
+        """通过 F 公共读取接口取得当前票的目的国确认来源（只读）。
+
+        报告必须反映下一次离线运行实际采用的目的国及其最近确认审计，
+        因此这里读取 ``BatchDestinationService`` 的当前值，而不是自行
+        猜测或重放信任 client 提供的国家名/alpha3。
+        """
+        from .batch_destinations import BatchDestinationService
+
+        data = BatchDestinationService(
+            self.db, self.references, self.tasks, self.logger
+        ).get_batch_destinations(batch_id)
+        row = next(
+            (item for item in data.get("rows") or []
+             if str(item.get("task_id")) == task_id),
+            None,
+        )
+        if row is None:
+            raise ValidationError(
+                "该票不在批次目的国确认列表中：拒绝离线执行，未创建任何输出")
+        revision = row.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValidationError(
+                "目的国确认修订标识无效：拒绝离线执行，未创建任何输出")
+        alpha3 = str(row.get("destination_alpha3") or "").strip() or None
+        name = str(row.get("destination_name") or "").strip() or None
+        if alpha3 and not name:
+            name = alpha3
+        return {
+            "name": name,
+            "alpha3": alpha3,
+            "revision": revision,
+            "confirmed_by": row.get("confirmed_by"),
+            "confirmed_at": row.get("confirmed_at"),
+        }
+
     def run_task(
         self,
         task_id: str,
@@ -293,6 +331,10 @@ class BatchOfflineRunner:
                 "TOCTOU 篡改），已拒绝离线执行；未创建任何输出")
 
         batch_link = hold or {}
+        # 目的国来源只取 F 公共读取结果（当前票确认审计 + 当前值）；缺失
+        # 时如实为空，由核心按既有规则保持 waiting_input，绝不猜测。
+        destination_confirmation = self._destination_confirmation(
+            str(batch_link["batch_id"]), task_id)
         report: dict[str, Any] = {
             "schema": REPORT_SCHEMA,
             "task_id": task_id,
@@ -301,6 +343,7 @@ class BatchOfflineRunner:
             "candidate_key": batch_link.get("candidate_key"),
             "actor": actor,
             "started_at": started_at,
+            "destination": destination_confirmation,
             "snapshot": {
                 "path": str(snapshot_file),
                 "trusted_hash": verify.get("trusted_hash"),
@@ -314,13 +357,14 @@ class BatchOfflineRunner:
             },
         }
 
-        # 2) 目的国只取该任务自身；references 只取既有参考服务。缺失不猜：
-        #    destination=None 由核心按既有规则如实 waiting_input。
+        # 2) 目的国只取该票当前确认来源；references 只取既有参考服务。
+        #    缺失不猜：destination=None 由核心按既有规则如实 waiting_input。
         destination = None
-        if task.get("destination_alpha3"):
+        if destination_confirmation["alpha3"]:
             destination = {
-                "name": task.get("destination_name") or task["destination_alpha3"],
-                "alpha3": task["destination_alpha3"],
+                "name": destination_confirmation["name"]
+                or destination_confirmation["alpha3"],
+                "alpha3": destination_confirmation["alpha3"],
             }
         references = self.references.core_references()
         report["references"] = {
